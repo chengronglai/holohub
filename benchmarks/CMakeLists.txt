@@ -13,5 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_holohub_application(green_context_benchmarking)
 add_holohub_application(model_benchmarking)
 add_holohub_application(realtime_threads_benchmarking)

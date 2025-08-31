@@ -1,0 +1,35 @@
+{
+	"benchmark": {
+		"name": "Green Context Benchmarking",
+		"authors": [
+			{
+				"name": "Holoscan Team",
+				"affiliation": "NVIDIA"
+			}
+		],
+		"language": "cpp",
+		"version": "1.0",
+		"changelog": {
+			"1.0": "Initial Release"
+		},
+		"holoscan_sdk": {
+			"minimum_required_version": "3.6.0",
+			"tested_versions": [
+				"3.6.0"
+			]
+		},
+		"platforms": [
+			"x86_64",
+			"aarch64"
+		],
+		"tags": ["Benchmarking", "CUDA", "Green Context", "Scheduling"],
+		"ranking": 1,
+		"requirements": {
+			"gpu": "required"
+		},
+		"run": {
+			"command": "<holohub_app_bin>/green_context_benchmarking",
+			"workdir": "holohub_app_bin"
+		}
+	}
+}
