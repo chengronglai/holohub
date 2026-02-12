@@ -1,4 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+%YAML 1.2
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-add_holohub_application(model_benchmarking)
-add_holohub_application(realtime_threads_benchmarking)
-add_holohub_application(green_context_benchmarking)
-add_holohub_application(green_context_trt_benchmarking)
+---
+# InferenceOp configuration for the Green Context TRT benchmark.
+# model_path_map, pre_processor_map, and inference_map are set
+# programmatically in C++ -- only backend settings are configured here.
+inference:
+  backend: "trt"
+  input_on_cuda: true
+  output_on_cuda: true
+  transmit_on_cuda: true
+  enable_fp16: false
