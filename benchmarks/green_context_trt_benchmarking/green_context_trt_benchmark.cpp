@@ -191,9 +191,7 @@ class TensorSourceOp : public Operator {
         nvidia::gxf::ComputeTrivialStrides(shape, element_size),
         nvidia::gxf::MemoryStorageType::kDevice,
         d_input_data_,
-        // No-op release callback: memory is owned by this op and reused across ticks.
-        // This is safe because inference treats input tensors as read-only.
-        [](void*) { return nvidia::gxf::Success; });
+        [](void*) { return nvidia::gxf::Success; });  // no-op: memory owned by this op
 
     if (!result) {
       throw std::runtime_error("[TensorSourceOp] Failed to wrap memory in tensor");
@@ -252,9 +250,8 @@ class InferenceComputeTracker {
 // Global tracker for InferenceOp compute time (wall-clock around InferenceOp::compute)
 static InferenceComputeTracker g_inference_compute_tracker;
 
-// Readiness gate: prevents TimingBenchmarkOp from recording measurements until
-// the inference pipeline has produced its first output (i.e. the TensorRT engine
-// is built/loaded and inference is actually running on the GPU).
+// Set once inference pipeline produces its first output; gates TimingBenchmarkOp
+// measurement so samples are only collected under actual inference contention.
 static std::atomic<bool> g_inference_pipeline_ready{false};
 
 // ============================================================================
@@ -297,9 +294,7 @@ class InferenceTimingSinkOp : public Operator {
     // Consume input to act as a sink and signal pipeline readiness.
     (void)op_input.receive<std::any>("in");
 
-    // Signal that the inference pipeline is warmed up and producing outputs.
-    // This unblocks TimingBenchmarkOp's measurement phase so that timing
-    // samples are only collected under actual TRT inference contention.
+    // Signal that inference is running; unblocks TimingBenchmarkOp measurement.
     if (!g_inference_pipeline_ready.load(std::memory_order_relaxed)) {
       g_inference_pipeline_ready.store(true, std::memory_order_release);
       HOLOSCAN_LOG_INFO("[InferenceTimingSinkOp] Inference pipeline is warmed up "
@@ -369,10 +364,8 @@ class TimingBenchmarkOp : public Operator {
     }
 
     // ---- Phase 1: Wait for inference pipeline to be ready ----
-    // The TensorRT engine build/load can take seconds. We must not record
-    // timing measurements until InferenceOp is actually running inference
-    // on the GPU, otherwise the "baseline" run measures zero-contention
-    // while the "GC" run (with cached engine) measures real contention.
+    // Don't record until inference is running, otherwise baseline measures
+    // zero-contention while the GC run (with cached engine) sees real load.
     if (!g_inference_pipeline_ready.load(std::memory_order_acquire)) {
       // Run the kernel to keep the CUDA stream/context active, but discard results
       async_run_simple_benchmark_kernel(d_benchmark_data_, workload_size_.get(),
@@ -538,18 +531,17 @@ class GreenContextTrtBenchmarkApp : public holoscan::Application {
  public:
   explicit GreenContextTrtBenchmarkApp(bool use_green_context, int total_samples,
                                        int warmup_samples, const std::string& model_path,
-                                       int input_size)
+                                       int input_size, const std::string& backend = "trt",
+                                       int sms_per_partition = 0)
       : use_green_context_(use_green_context),
         total_samples_(total_samples),
         warmup_samples_(warmup_samples),
         model_path_(model_path),
-        input_size_(input_size) {}
+        input_size_(input_size),
+        backend_(backend),
+        sms_per_partition_(sms_per_partition) {}
 
   void compose() override {
-    // --- Setup stream pools first (needed before creating operators) ---
-    // Following the SDK test pattern: pass cuda_stream_pool directly in make_operator,
-    // not via add_arg after construction.
-
     std::shared_ptr<CudaStreamPool> inference_stream_pool;
     std::shared_ptr<CudaStreamPool> timing_stream_pool;
     // GC resources need to stay in scope for add_arg to TimingBenchmarkOp
@@ -566,10 +558,22 @@ class GreenContextTrtBenchmarkApp : public holoscan::Application {
           prop.multiProcessorCount, prop.major, prop.minor);
 
         int total_sms = prop.multiProcessorCount;
-        int sms_per_partition = std::max(4, (total_sms / 2) & ~3);
+        int sms_per_partition;
+        if (sms_per_partition_ > 0) {
+          // User-specified SM count per partition (rounded down to multiple of 4)
+          sms_per_partition = sms_per_partition_ & ~3;
+          sms_per_partition = std::max(4, sms_per_partition);
+          HOLOSCAN_LOG_INFO("Using user-specified {} SMs per partition (requested: {})",
+                            sms_per_partition, sms_per_partition_);
+        } else {
+          // Auto: use half the GPU SMs
+          sms_per_partition = std::max(4, (total_sms / 2) & ~3);
+        }
 
         if (sms_per_partition * 2 > total_sms) {
-          throw std::runtime_error("GPU too small for Green Context (need at least 8 SMs)");
+          throw std::runtime_error("GPU too small for requested partition size (need at least " +
+                                   std::to_string(sms_per_partition * 2) + " SMs, have " +
+                                   std::to_string(total_sms) + ")");
         }
 
         std::vector<uint32_t> partitions = {static_cast<uint32_t>(sms_per_partition),
@@ -639,15 +643,17 @@ class GreenContextTrtBenchmarkApp : public holoscan::Application {
 
     auto pool_resource = make_resource<UnboundedAllocator>("pool");
 
-    // Pass cuda_stream_pool directly in make_operator (matches SDK test pattern)
+    // Must pass cuda_stream_pool as a named arg; positional does not populate
+    // the Parameter so the backend falls back to a non-GC stream.
     inference_op_ = make_operator<CustomInferenceOp>(
         "inference_op",
         from_config("inference"),
+        Arg("backend", backend_),
         Arg("model_path_map", model_path_map),
         Arg("pre_processor_map", pre_processor_map),
         Arg("inference_map", inference_map),
         Arg("allocator") = pool_resource,
-        inference_stream_pool);
+        Arg("cuda_stream_pool") = inference_stream_pool);
 
     sink_op_ = make_operator<InferenceTimingSinkOp>("sink_op");
 
@@ -695,6 +701,8 @@ class GreenContextTrtBenchmarkApp : public holoscan::Application {
   int warmup_samples_;
   std::string model_path_;
   int input_size_;
+  std::string backend_;
+  int sms_per_partition_;  // 0 = auto (half the GPU SMs)
   std::shared_ptr<TensorSourceOp> tensor_source_op_;
   std::shared_ptr<CustomInferenceOp> inference_op_;
   std::shared_ptr<InferenceTimingSinkOp> sink_op_;
@@ -754,19 +762,24 @@ void print_title(const std::string& title) {
 
 void print_benchmark_config(const std::string& mode, int total_samples,
                             int warmup_samples, const std::string& model_path,
-                            int input_size) {
+                            int input_size, const std::string& backend,
+                            int sms_per_partition) {
   std::cout << "  Benchmark Mode: " << mode << std::endl;
+  std::cout << "  Backend: " << backend << std::endl;
   std::cout << "  Measurement Samples: " << total_samples << std::endl;
   std::cout << "  Warmup Samples: " << warmup_samples
             << " (+ engine build wait)" << std::endl;
   std::cout << "  Model Path: " << model_path << std::endl;
   std::cout << "  Input Size: " << input_size << std::endl;
+  std::cout << "  SMs Per Partition: "
+            << (sms_per_partition > 0 ? std::to_string(sms_per_partition) : "auto (half GPU)")
+            << std::endl;
 }
 
 void print_usage(const char* program_name) {
   std::cout << "Green Context TRT Inference Benchmark\n\n";
   std::cout
-      << "Measures CUDA kernel launch-start time with TensorRT inference as contending "
+      << "Measures CUDA kernel launch-start time with inference as contending "
          "workload\n\n";
   std::cout << "Usage: " << program_name << " [OPTIONS]\n";
   std::cout << "Options:\n";
@@ -774,6 +787,9 @@ void print_usage(const char* program_name) {
   std::cout << "  --warmup-samples N   Post-ready warmup iterations to discard (default: 100)\n";
   std::cout << "  --model-path PATH    Path to ONNX model file (default: ./benchmark_model.onnx)\n";
   std::cout << "  --input-size N       Input tensor size matching the model (default: 1024)\n";
+  std::cout << "  --backend BACKEND    Inference backend: 'trt' or 'onnxrt' (default: trt)\n";
+  std::cout << "  --sms-per-partition N SMs per green context partition (default: auto = half GPU)\n";
+  std::cout << "                        Use smaller values (8, 16) to stress-test SM partitioning\n";
   std::cout << "  --mode MODE          Run mode: 'baseline', 'green-context', "
                "or 'all' (default: all)\n";
   std::cout << "                        baseline: Run only without green context\n";
@@ -793,6 +809,8 @@ int main(int argc, char* argv[]) {
   int warmup_samples = 100;
   std::string model_path = "benchmark_model.onnx";
   int input_size = 1024;
+  std::string backend = "trt";
+  int sms_per_partition = 0;  // 0 = auto (half the GPU)
   std::string mode = "all";
 
   // Parse command line arguments
@@ -822,6 +840,18 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: input-size must be positive\n";
         return 1;
       }
+    } else if (arg == "--backend" && i + 1 < argc) {
+      backend = argv[++i];
+      if (backend != "trt" && backend != "onnxrt") {
+        std::cerr << "Error: backend must be 'trt' or 'onnxrt'\n";
+        return 1;
+      }
+    } else if (arg == "--sms-per-partition" && i + 1 < argc) {
+      sms_per_partition = std::atoi(argv[++i]);
+      if (sms_per_partition < 0) {
+        std::cerr << "Error: sms-per-partition must be non-negative (0 = auto)\n";
+        return 1;
+      }
     } else if (arg == "--mode" && i + 1 < argc) {
       mode = argv[++i];
       if (mode != "baseline" && mode != "green-context" && mode != "all") {
@@ -846,9 +876,10 @@ int main(int argc, char* argv[]) {
   // Resolve to absolute path for InferenceOp
   model_path = std::filesystem::absolute(model_path).string();
 
-  print_title("Green Context TRT Inference Benchmark");
+  print_title("Green Context Inference Benchmark");
   std::cout << "Benchmark Configurations:" << std::endl;
-  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size);
+  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size, backend,
+                         sms_per_partition);
 
   // Initialize CUDA
   HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(0), "Failed to set CUDA device");
@@ -862,7 +893,6 @@ int main(int argc, char* argv[]) {
   }
 
   // Resolve YAML config path (same directory as the executable).
-  // canonical() can throw for some launch modes, so use a robust fallback.
   std::filesystem::path exe_dir;
   try {
     exe_dir = std::filesystem::canonical(argv[0]).parent_path();
@@ -892,7 +922,8 @@ int main(int argc, char* argv[]) {
 
     try {
       auto app_no_gc = std::make_unique<GreenContextTrtBenchmarkApp>(
-          false, total_samples, warmup_samples, model_path, input_size);
+          false, total_samples, warmup_samples, model_path, input_size, backend,
+          sms_per_partition);
       app_no_gc->config(config_path);
       app_no_gc->scheduler(app_no_gc->make_scheduler<holoscan::EventBasedScheduler>(
           "event-based", holoscan::Arg("worker_thread_number", static_cast<int64_t>(4))));
@@ -923,7 +954,8 @@ int main(int argc, char* argv[]) {
 
     try {
       auto app_with_gc = std::make_unique<GreenContextTrtBenchmarkApp>(
-          true, total_samples, warmup_samples, model_path, input_size);
+          true, total_samples, warmup_samples, model_path, input_size, backend,
+          sms_per_partition);
       app_with_gc->config(config_path);
       app_with_gc->scheduler(app_with_gc->make_scheduler<holoscan::EventBasedScheduler>(
           "event-based", holoscan::Arg("worker_thread_number", static_cast<int64_t>(4))));
@@ -945,7 +977,8 @@ int main(int argc, char* argv[]) {
 
   // Display benchmark configurations
   print_title("Benchmark Configurations");
-  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size);
+  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size, backend,
+                         sms_per_partition);
   std::cout << std::endl;
 
   // Display comprehensive benchmark results
