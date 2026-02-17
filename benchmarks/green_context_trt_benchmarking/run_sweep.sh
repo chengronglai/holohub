@@ -29,16 +29,15 @@ CONTAINER_HOLOHUB_ROOT="/workspace/holohub"
 
 # ── Sweep parameters (edit these to customize your sweep) ─────────────────────
 BACKENDS=(trt onnxrt)
-SAMPLE_COUNTS=(5000)
-REPEATS=5           # Number of times to repeat each configuration
-WARMUP_SAMPLES=500
-SMS_PER_PARTITION=0 # 0 = auto (half GPU). Set to e.g. 8 or 16 to stress-test SM partitioning.
+SAMPLE_COUNTS=(1000)
+REPEATS=3
+WARMUP_SAMPLES=100
 MODE="all"  # baseline | green-context | all
 
+# SM partition sizes to sweep. 0 = auto (half GPU).
+SMS_CONFIGS=(8 16 32 48 0)
+
 # Model configurations: "label:hidden_size:num_layers:input_size"
-# Increase hidden_size / num_layers to create more GPU contention.
-# The label is used in file names and summary tables.
-# Note: "small" (2048:3) omitted -- too little contention for meaningful results.
 MODEL_CONFIGS=(
     "medium:4096:6:1024"
     "large:6144:8:1024"
@@ -55,7 +54,7 @@ while [[ $# -gt 0 ]]; do
         --backends)
             IFS=' ' read -ra BACKENDS <<< "$2"; shift 2 ;;
         --repeats)      REPEATS="$2"; shift 2 ;;
-        --sms)          SMS_PER_PARTITION="$2"; shift 2 ;;
+        --sms)          IFS=' ' read -ra SMS_CONFIGS <<< "$2"; shift 2 ;;
         --samples)
             IFS=' ' read -ra SAMPLE_COUNTS <<< "$2"; shift 2 ;;
         --models)
@@ -75,8 +74,8 @@ Options:
   --docker-opts OPTS     Extra docker options
   --backends "B1 B2"     Backends to sweep (default: "trt onnxrt")
   --repeats N            Repeat each configuration N times (default: 5)
-  --sms N                SMs per GC partition (default: 0 = auto/half GPU)
-                         Use 8 or 16 to stress-test SM partitioning
+  --sms "N1 N2 ..."      SM partition sizes to sweep (default: "8 16 32 48 0")
+                         0 = auto (half GPU). Multiple values to find sweet spot
   --samples "N1 N2 ..."  Override sample counts (default: "5000")
   --models "CONFIGS"     Override model configs (default: medium/large)
                          Format per config: "label:hidden_size:num_layers:input_size"
@@ -106,7 +105,7 @@ done
 # ── Setup ─────────────────────────────────────────────────────────────────────
 mkdir -p "$RESULTS_DIR"
 
-TOTAL_RUNS=$(( ${#BACKENDS[@]} * ${#MODEL_CONFIGS[@]} * ${#SAMPLE_COUNTS[@]} * REPEATS ))
+TOTAL_RUNS=$(( ${#BACKENDS[@]} * ${#MODEL_CONFIGS[@]} * ${#SAMPLE_COUNTS[@]} * ${#SMS_CONFIGS[@]} * REPEATS ))
 
 echo "╔════════════════════════════════════════════════════════════════════════╗"
 echo "║            Green Context Inference Benchmark Sweep                    ║"
@@ -115,9 +114,9 @@ echo ""
 echo "  Results directory: $RESULTS_DIR"
 echo "  Mode:             $MODE"
 echo "  Backends:         ${BACKENDS[*]}"
+echo "  SM partitions:    ${SMS_CONFIGS[*]}"
 echo "  Sample counts:    ${SAMPLE_COUNTS[*]}"
 echo "  Repeats:          $REPEATS"
-echo "  SMs/partition:    ${SMS_PER_PARTITION:-0 (auto)}"
 echo "  Warmup samples:   $WARMUP_SAMPLES"
 echo "  Model configs:    ${MODEL_CONFIGS[*]}"
 echo "  Total runs:       $TOTAL_RUNS"
@@ -192,14 +191,15 @@ host_to_container_path() {
 
 # ── Helper: run one benchmark configuration ──────────────────────────────────
 run_benchmark() {
-    local backend="$1" label="$2" model_path="$3" input_size="$4" samples="$5" repeat="$6"
-    local run_id="${backend}_${label}_s${samples}_r${repeat}"
+    local backend="$1" label="$2" model_path="$3" input_size="$4" samples="$5" sms="$6" repeat="$7"
+    local sms_label; [[ "$sms" == "0" ]] && sms_label="auto" || sms_label="${sms}sm"
+    local run_id="${backend}_${label}_${sms_label}_s${samples}_r${repeat}"
     local log_file="$RESULTS_DIR/${run_id}.log"
 
     echo "  [run] $run_id ..."
 
     if $LOCAL_MODE; then
-        local run_args="--samples $samples --warmup-samples $WARMUP_SAMPLES --mode $MODE --input-size $input_size --model-path $model_path --backend $backend --sms-per-partition $SMS_PER_PARTITION"
+        local run_args="--samples $samples --warmup-samples $WARMUP_SAMPLES --mode $MODE --input-size $input_size --model-path $model_path --backend $backend --sms-per-partition $sms"
         local bin
         bin=$(find_binary)
         if $DRY_RUN; then
@@ -216,7 +216,7 @@ run_benchmark() {
     else
         local container_model_path
         container_model_path=$(host_to_container_path "$model_path")
-        local run_args="--samples $samples --warmup-samples $WARMUP_SAMPLES --mode $MODE --input-size $input_size --model-path $container_model_path --backend $backend --sms-per-partition $SMS_PER_PARTITION"
+        local run_args="--samples $samples --warmup-samples $WARMUP_SAMPLES --mode $MODE --input-size $input_size --model-path $container_model_path --backend $backend --sms-per-partition $sms"
 
         local docker_opts="--user root"
         [[ -n "$EXTRA_DOCKER_OPTS" ]] && docker_opts="$docker_opts $EXTRA_DOCKER_OPTS"
@@ -378,11 +378,14 @@ for backend in "${BACKENDS[@]}"; do
         model_path="${MODEL_PATHS[$label]}"
 
         for samples in "${SAMPLE_COUNTS[@]}"; do
-            for repeat in $(seq 1 "$REPEATS"); do
-                RUN_NUM=$((RUN_NUM + 1))
-                echo ""
-                echo "──── Run $RUN_NUM / $TOTAL_RUNS: backend=$backend, model=$label, samples=$samples, repeat=$repeat/$REPEATS ────"
-                run_benchmark "$backend" "$label" "$model_path" "$input_size" "$samples" "$repeat"
+            for sms in "${SMS_CONFIGS[@]}"; do
+                local_sms_label=$([[ "$sms" == "0" ]] && echo "auto" || echo "${sms}sm")
+                for repeat in $(seq 1 "$REPEATS"); do
+                    RUN_NUM=$((RUN_NUM + 1))
+                    echo ""
+                    echo "──── Run $RUN_NUM / $TOTAL_RUNS: backend=$backend, model=$label, sms=$local_sms_label, repeat=$repeat/$REPEATS ────"
+                    run_benchmark "$backend" "$label" "$model_path" "$input_size" "$samples" "$sms" "$repeat"
+                done
             done
         done
     done
@@ -422,269 +425,167 @@ render_table \
     "TABLE 1: CUDA Kernel Launch-Start Latency (μs) — PRIMARY METRIC" \
     "Lower = better. Positive Δ% = GC improved scheduling."
 
-printf "%-7s %-8s %3s │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
-    "Backend" "Model" "Run" \
+printf "%-7s %-8s %5s %3s │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
+    "Backend" "Model" "SMs" "Run" \
     "BL Avg" "BL P50" "BL P95" "BL P99" \
     "GC Avg" "GC P50" "GC P95" "GC P99" \
     "Δ Avg%" "Δ P95%" "Δ P99%"
-printf '─%.0s' {1..130}; echo ""
+printf '─%.0s' {1..138}; echo ""
 
 for backend in "${BACKENDS[@]}"; do
     for config in "${MODEL_CONFIGS[@]}"; do
         IFS=':' read -r label hidden layers input_size <<< "$config"
         for samples in "${SAMPLE_COUNTS[@]}"; do
-            # Accumulators for computing mean across repeats
-            sum_bl_avg=0; sum_gc_avg=0; sum_d_avg=0; n_valid=0
+            for sms in "${SMS_CONFIGS[@]}"; do
+                sms_label=$([[ "$sms" == "0" ]] && echo "auto" || echo "$sms")
+                sum_bl_avg=0; sum_gc_avg=0; sum_d_avg=0; n_valid=0
 
-            for repeat in $(seq 1 "$REPEATS"); do
-                run_id="${backend}_${label}_s${samples}_r${repeat}"
-                log_file="$RESULTS_DIR/${run_id}.log"
-                if [[ ! -f "$log_file" ]]; then
-                    printf "%-7s %-8s  r%d │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
-                        "$backend" "$label" "$repeat" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-"
-                    continue
-                fi
-                parse_log "$log_file"
-                printf "%-7s %-8s  r%d │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
-                    "$backend" "$label" "$repeat" \
-                    "${bl_launch_avg:--}" "${bl_launch_p50:--}" "${bl_launch_p95:--}" "${bl_launch_p99:--}" \
-                    "${gc_launch_avg:--}" "${gc_launch_p50:--}" "${gc_launch_p95:--}" "${gc_launch_p99:--}" \
-                    "${d_launch_avg:--}" "${d_launch_p95:--}" "${d_launch_p99:--}"
-
-                # Accumulate for mean (only if values are numeric)
-                if [[ -n "${bl_launch_avg}" && -n "${gc_launch_avg}" && -n "${d_launch_avg}" ]]; then
-                    sum_bl_avg=$(awk "BEGIN{printf \"%.2f\", $sum_bl_avg + ${bl_launch_avg}}")
-                    sum_gc_avg=$(awk "BEGIN{printf \"%.2f\", $sum_gc_avg + ${gc_launch_avg}}")
-                    sum_d_avg=$(awk "BEGIN{printf \"%.2f\", $sum_d_avg + ${d_launch_avg/+/}}")
-                    n_valid=$((n_valid + 1))
-                fi
-            done
-
-            # Print MEAN row
-            if [[ $n_valid -gt 0 ]]; then
-                mean_bl=$(awk "BEGIN{printf \"%.2f\", $sum_bl_avg / $n_valid}")
-                mean_gc=$(awk "BEGIN{printf \"%.2f\", $sum_gc_avg / $n_valid}")
-                mean_d=$(awk "BEGIN{printf \"%.2f\", $sum_d_avg / $n_valid}")
-                printf "\e[1m%-7s %-8s MEAN│ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\e[0m\n" \
-                    "$backend" "$label" \
-                    "$mean_bl" "" "" "" \
-                    "$mean_gc" "" "" "" \
-                    "$mean_d" "" ""
-            fi
-            printf '·%.0s' {1..130}; echo ""
-        done
-    done
-    printf '─%.0s' {1..130}; echo ""
-done
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Table 2: Benchmark Kernel Execution Time
-# ─────────────────────────────────────────────────────────────────────────────
-render_table \
-    "TABLE 2: Benchmark Kernel Execution Time (μs)" \
-    "Measures how long the timing kernel itself runs on GPU. Lower with GC = less SM contention."
-
-printf "%-7s %-8s %3s │ %8s %8s %8s │ %8s %8s %8s │ %8s\n" \
-    "Backend" "Model" "Run" \
-    "BL Avg" "BL P50" "BL P95" \
-    "GC Avg" "GC P50" "GC P95" \
-    "Δ Avg%"
-printf '─%.0s' {1..90}; echo ""
-
-for backend in "${BACKENDS[@]}"; do
-    for config in "${MODEL_CONFIGS[@]}"; do
-        IFS=':' read -r label hidden layers input_size <<< "$config"
-        for samples in "${SAMPLE_COUNTS[@]}"; do
-            sum_bl=0; sum_gc=0; sum_d=0; n_valid=0
-            for repeat in $(seq 1 "$REPEATS"); do
-                run_id="${backend}_${label}_s${samples}_r${repeat}"
-                log_file="$RESULTS_DIR/${run_id}.log"
-                if [[ ! -f "$log_file" ]]; then
-                    printf "%-7s %-8s  r%d │ %8s %8s %8s │ %8s %8s %8s │ %8s\n" \
-                        "$backend" "$label" "$repeat" "-" "-" "-" "-" "-" "-" "-"
-                    continue
-                fi
-                parse_log "$log_file"
-                printf "%-7s %-8s  r%d │ %8s %8s %8s │ %8s %8s %8s │ %8s\n" \
-                    "$backend" "$label" "$repeat" \
-                    "${bl_exec_avg:--}" "${bl_exec_p50:--}" "${bl_exec_p95:--}" \
-                    "${gc_exec_avg:--}" "${gc_exec_p50:--}" "${gc_exec_p95:--}" \
-                    "${d_exec_avg:--}"
-                if [[ -n "${bl_exec_avg}" && -n "${gc_exec_avg}" && -n "${d_exec_avg}" ]]; then
-                    sum_bl=$(awk "BEGIN{printf \"%.2f\", $sum_bl + ${bl_exec_avg}}")
-                    sum_gc=$(awk "BEGIN{printf \"%.2f\", $sum_gc + ${gc_exec_avg}}")
-                    sum_d=$(awk "BEGIN{printf \"%.2f\", $sum_d + ${d_exec_avg/+/}}")
-                    n_valid=$((n_valid + 1))
-                fi
-            done
-            if [[ $n_valid -gt 0 ]]; then
-                printf "\e[1m%-7s %-8s MEAN│ %8s %8s %8s │ %8s %8s %8s │ %8s\e[0m\n" \
-                    "$backend" "$label" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_bl/$n_valid}")" "" "" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_gc/$n_valid}")" "" "" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_d/$n_valid}")"
-            fi
-            printf '·%.0s' {1..90}; echo ""
-        done
-    done
-    printf '─%.0s' {1..90}; echo ""
-done
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Table 3: InferenceOp Compute Time (wall-clock)
-# ─────────────────────────────────────────────────────────────────────────────
-render_table \
-    "TABLE 3: InferenceOp Compute Time — Wall-Clock (μs)" \
-    "Wall-clock time of InferenceOp::compute(). Positive Δ = GC slows inference (expected with fewer SMs)."
-
-printf "%-7s %-8s %3s │ %8s %8s %8s %6s │ %8s %8s %8s %6s │ %8s\n" \
-    "Backend" "Model" "Run" \
-    "BL Avg" "BL P50" "BL P95" "BL N" \
-    "GC Avg" "GC P50" "GC P95" "GC N" \
-    "Δ Avg%"
-printf '─%.0s' {1..105}; echo ""
-
-for backend in "${BACKENDS[@]}"; do
-    for config in "${MODEL_CONFIGS[@]}"; do
-        IFS=':' read -r label hidden layers input_size <<< "$config"
-        for samples in "${SAMPLE_COUNTS[@]}"; do
-            sum_bl=0; sum_gc=0; sum_d=0; n_valid=0
-            for repeat in $(seq 1 "$REPEATS"); do
-                run_id="${backend}_${label}_s${samples}_r${repeat}"
-                log_file="$RESULTS_DIR/${run_id}.log"
-                if [[ ! -f "$log_file" ]]; then
-                    printf "%-7s %-8s  r%d │ %8s %8s %8s %6s │ %8s %8s %8s %6s │ %8s\n" \
-                        "$backend" "$label" "$repeat" "-" "-" "-" "-" "-" "-" "-" "-" "-"
-                    continue
-                fi
-                parse_log "$log_file"
-                printf "%-7s %-8s  r%d │ %8s %8s %8s %6s │ %8s %8s %8s %6s │ %8s\n" \
-                    "$backend" "$label" "$repeat" \
-                    "${bl_infer_avg:--}" "${bl_infer_p50:--}" "${bl_infer_p95:--}" "${bl_infer_cnt:--}" \
-                    "${gc_infer_avg:--}" "${gc_infer_p50:--}" "${gc_infer_p95:--}" "${gc_infer_cnt:--}" \
-                    "${d_infer_avg:--}"
-                if [[ -n "${bl_infer_avg}" && -n "${gc_infer_avg}" && -n "${d_infer_avg}" ]]; then
-                    sum_bl=$(awk "BEGIN{printf \"%.2f\", $sum_bl + ${bl_infer_avg}}")
-                    sum_gc=$(awk "BEGIN{printf \"%.2f\", $sum_gc + ${gc_infer_avg}}")
-                    sum_d=$(awk "BEGIN{printf \"%.2f\", $sum_d + ${d_infer_avg/+/}}")
-                    n_valid=$((n_valid + 1))
-                fi
-            done
-            if [[ $n_valid -gt 0 ]]; then
-                printf "\e[1m%-7s %-8s MEAN│ %8s %8s %8s %6s │ %8s %8s %8s %6s │ %8s\e[0m\n" \
-                    "$backend" "$label" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_bl/$n_valid}")" "" "" "" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_gc/$n_valid}")" "" "" "" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_d/$n_valid}")"
-            fi
-            printf '·%.0s' {1..105}; echo ""
-        done
-    done
-    printf '─%.0s' {1..105}; echo ""
-done
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Table 4: Inference Per-Kernel GPU Execution Time (CUPTI)
-# ─────────────────────────────────────────────────────────────────────────────
-render_table \
-    "TABLE 4: Inference Per-Kernel GPU Execution Time — CUPTI (μs)" \
-    "Near-zero Δ = inference kernels NOT partitioned (bypass GC). Positive Δ = GC IS partitioning."
-
-printf "%-7s %-8s %3s │ %8s %8s %8s %7s │ %8s %8s %8s %7s │ %7s %7s %7s\n" \
-    "Backend" "Model" "Run" \
-    "BL Avg" "BL P50" "BL P95" "BL #K" \
-    "GC Avg" "GC P50" "GC P95" "GC #K" \
-    "Δ Avg%" "Δ P50%" "Δ P95%"
-printf '─%.0s' {1..120}; echo ""
-
-for backend in "${BACKENDS[@]}"; do
-    for config in "${MODEL_CONFIGS[@]}"; do
-        IFS=':' read -r label hidden layers input_size <<< "$config"
-        for samples in "${SAMPLE_COUNTS[@]}"; do
-            sum_d=0; n_valid=0
-            for repeat in $(seq 1 "$REPEATS"); do
-                run_id="${backend}_${label}_s${samples}_r${repeat}"
-                log_file="$RESULTS_DIR/${run_id}.log"
-                if [[ ! -f "$log_file" ]]; then
-                    printf "%-7s %-8s  r%d │ %8s %8s %8s %7s │ %8s %8s %8s %7s │ %7s %7s %7s\n" \
-                        "$backend" "$label" "$repeat" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-"
-                    continue
-                fi
-                parse_log "$log_file"
-                printf "%-7s %-8s  r%d │ %8s %8s %8s %7s │ %8s %8s %8s %7s │ %7s %7s %7s\n" \
-                    "$backend" "$label" "$repeat" \
-                    "${ik_bl_avg:--}" "${ik_bl_p50:--}" "${ik_bl_p95:--}" "${ik_bl_cnt:--}" \
-                    "${ik_gc_avg:--}" "${ik_gc_p50:--}" "${ik_gc_p95:--}" "${ik_gc_cnt:--}" \
-                    "${ik_d_avg:--}" "${ik_d_p50:--}" "${ik_d_p95:--}"
-                if [[ -n "${ik_d_avg}" ]]; then
-                    sum_d=$(awk "BEGIN{printf \"%.2f\", $sum_d + ${ik_d_avg/+/}}")
-                    n_valid=$((n_valid + 1))
-                fi
-            done
-            if [[ $n_valid -gt 0 ]]; then
-                printf "\e[1m%-7s %-8s MEAN│ %8s %8s %8s %7s │ %8s %8s %8s %7s │ %7s %7s %7s\e[0m\n" \
-                    "$backend" "$label" \
-                    "" "" "" "" \
-                    "" "" "" "" \
-                    "$(awk "BEGIN{printf \"%.2f\", $sum_d/$n_valid}")" "" ""
-            fi
-            printf '·%.0s' {1..120}; echo ""
-        done
-    done
-    printf '─%.0s' {1..120}; echo ""
-done
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick comparison: MEAN launch-start across repeats, one row per backend x model
-# ─────────────────────────────────────────────────────────────────────────────
-if [[ ${#BACKENDS[@]} -ge 2 && ${#SAMPLE_COUNTS[@]} -eq 1 ]]; then
-    samples="${SAMPLE_COUNTS[0]}"
-    echo ""
-    echo "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
-    echo "│  QUICK COMPARISON: Backend vs Backend — MEAN Launch-Start Avg μs over $REPEATS repeats ($samples samples each)     │"
-    echo "└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-    echo ""
-    hdr="%-8s"
-    for backend in "${BACKENDS[@]}"; do
-        hdr+=" │ %8s %8s %8s"
-    done
-    hdr+="\n"
-    hdr_args=("Model")
-    for backend in "${BACKENDS[@]}"; do
-        hdr_args+=("${backend} BL" "${backend} GC" "${backend} Δ%")
-    done
-    printf "$hdr" "${hdr_args[@]}"
-    printf '─%.0s' {1..$(( 10 + ${#BACKENDS[@]} * 30 ))}; echo ""
-
-    for config in "${MODEL_CONFIGS[@]}"; do
-        IFS=':' read -r label hidden layers input_size <<< "$config"
-        row_args=("$label")
-        for backend in "${BACKENDS[@]}"; do
-            sum_bl=0; sum_gc=0; sum_d=0; n_valid=0
-            for repeat in $(seq 1 "$REPEATS"); do
-                run_id="${backend}_${label}_s${samples}_r${repeat}"
-                log_file="$RESULTS_DIR/${run_id}.log"
-                if [[ -f "$log_file" ]]; then
+                for repeat in $(seq 1 "$REPEATS"); do
+                    run_id="${backend}_${label}_${sms_label/auto/auto}_s${samples}_r${repeat}"
+                    [[ "$sms" != "0" ]] && run_id="${backend}_${label}_${sms}sm_s${samples}_r${repeat}"
+                    log_file="$RESULTS_DIR/${run_id}.log"
+                    if [[ ! -f "$log_file" ]]; then
+                        printf "%-7s %-8s %5s  r%d │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
+                            "$backend" "$label" "$sms_label" "$repeat" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-" "-"
+                        continue
+                    fi
                     parse_log "$log_file"
+                    printf "%-7s %-8s %5s  r%d │ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\n" \
+                        "$backend" "$label" "$sms_label" "$repeat" \
+                        "${bl_launch_avg:--}" "${bl_launch_p50:--}" "${bl_launch_p95:--}" "${bl_launch_p99:--}" \
+                        "${gc_launch_avg:--}" "${gc_launch_p50:--}" "${gc_launch_p95:--}" "${gc_launch_p99:--}" \
+                        "${d_launch_avg:--}" "${d_launch_p95:--}" "${d_launch_p99:--}"
+
                     if [[ -n "${bl_launch_avg}" && -n "${gc_launch_avg}" && -n "${d_launch_avg}" ]]; then
-                        sum_bl=$(awk "BEGIN{printf \"%.2f\", $sum_bl + ${bl_launch_avg}}")
-                        sum_gc=$(awk "BEGIN{printf \"%.2f\", $sum_gc + ${gc_launch_avg}}")
-                        sum_d=$(awk "BEGIN{printf \"%.2f\", $sum_d + ${d_launch_avg/+/}}")
+                        sum_bl_avg=$(awk "BEGIN{printf \"%.2f\", $sum_bl_avg + ${bl_launch_avg}}")
+                        sum_gc_avg=$(awk "BEGIN{printf \"%.2f\", $sum_gc_avg + ${gc_launch_avg}}")
+                        sum_d_avg=$(awk "BEGIN{printf \"%.2f\", $sum_d_avg + ${d_launch_avg/+/}}")
                         n_valid=$((n_valid + 1))
                     fi
+                done
+
+                if [[ $n_valid -gt 0 ]]; then
+                    mean_bl=$(awk "BEGIN{printf \"%.2f\", $sum_bl_avg / $n_valid}")
+                    mean_gc=$(awk "BEGIN{printf \"%.2f\", $sum_gc_avg / $n_valid}")
+                    mean_d=$(awk "BEGIN{printf \"%.2f\", $sum_d_avg / $n_valid}")
+                    printf "\e[1m%-7s %-8s %5s MEAN│ %8s %8s %8s %8s │ %8s %8s %8s %8s │ %8s %8s %8s\e[0m\n" \
+                        "$backend" "$label" "$sms_label" \
+                        "$mean_bl" "" "" "" \
+                        "$mean_gc" "" "" "" \
+                        "$mean_d" "" ""
                 fi
+                printf '·%.0s' {1..138}; echo ""
             done
-            if [[ $n_valid -gt 0 ]]; then
-                row_args+=("$(awk "BEGIN{printf \"%.2f\", $sum_bl/$n_valid}")")
-                row_args+=("$(awk "BEGIN{printf \"%.2f\", $sum_gc/$n_valid}")")
-                row_args+=("$(awk "BEGIN{printf \"%.2f\", $sum_d/$n_valid}")")
-            else
-                row_args+=("-" "-" "-")
-            fi
         done
-        printf "$hdr" "${row_args[@]}"
     done
-fi
+    printf '─%.0s' {1..138}; echo ""
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tables 2-4: MEAN-only summary across SM partition sizes
+# (Per-repeat detail is in Table 1; these show compact MEAN per SM config)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Helper: compute MEAN of a variable across repeats for a given config
+# Usage: compute_mean backend label sms samples variable_name
+# Prints the mean value or "-"
+compute_mean() {
+    local be="$1" lb="$2" sm="$3" sa="$4" var="$5"
+    local sm_lbl; [[ "$sm" == "0" ]] && sm_lbl="auto" || sm_lbl="${sm}sm"
+    local sum=0 n=0
+    for r in $(seq 1 "$REPEATS"); do
+        local rid="${be}_${lb}_${sm_lbl}_s${sa}_r${r}"
+        local lf="$RESULTS_DIR/${rid}.log"
+        [[ -f "$lf" ]] || continue
+        parse_log "$lf"
+        local val="${!var}"
+        if [[ -n "$val" ]]; then
+            sum=$(awk "BEGIN{printf \"%.2f\", $sum + ${val/+/}}")
+            n=$((n + 1))
+        fi
+    done
+    [[ $n -gt 0 ]] && awk "BEGIN{printf \"%.2f\", $sum / $n}" || echo "-"
+}
+
+render_table \
+    "TABLE 2: MEAN Launch-Start Latency by SM Partition Size (μs)" \
+    "Shows how partition size affects scheduling. Find the sweet spot for each backend."
+
+printf "%-7s %-8s %5s │ %9s %9s %9s │ %9s\n" \
+    "Backend" "Model" "SMs" "BL Avg" "GC Avg" "Δ Avg%" "Infer Δ%"
+printf '─%.0s' {1..65}; echo ""
+
+for backend in "${BACKENDS[@]}"; do
+    for config in "${MODEL_CONFIGS[@]}"; do
+        IFS=':' read -r label hidden layers input_size <<< "$config"
+        for samples in "${SAMPLE_COUNTS[@]}"; do
+            for sms in "${SMS_CONFIGS[@]}"; do
+                sms_label=$([[ "$sms" == "0" ]] && echo "auto" || echo "$sms")
+                m_bl=$(compute_mean "$backend" "$label" "$sms" "$samples" "bl_launch_avg")
+                m_gc=$(compute_mean "$backend" "$label" "$sms" "$samples" "gc_launch_avg")
+                m_d=$(compute_mean "$backend" "$label" "$sms" "$samples" "d_launch_avg")
+                m_ik=$(compute_mean "$backend" "$label" "$sms" "$samples" "ik_d_avg")
+                printf "%-7s %-8s %5s │ %9s %9s %9s │ %9s\n" \
+                    "$backend" "$label" "$sms_label" \
+                    "$m_bl" "$m_gc" "$m_d" "$m_ik"
+            done
+            printf '·%.0s' {1..65}; echo ""
+        done
+    done
+    printf '─%.0s' {1..65}; echo ""
+done
+
+render_table \
+    "TABLE 3: MEAN InferenceOp Compute Time by SM Partition Size (μs)" \
+    "Wall-clock InferenceOp::compute(). Positive Δ = GC slows inference (fewer SMs)."
+
+printf "%-7s %-8s %5s │ %9s %9s %9s\n" \
+    "Backend" "Model" "SMs" "BL Avg" "GC Avg" "Δ Avg%"
+printf '─%.0s' {1..50}; echo ""
+
+for backend in "${BACKENDS[@]}"; do
+    for config in "${MODEL_CONFIGS[@]}"; do
+        IFS=':' read -r label hidden layers input_size <<< "$config"
+        for samples in "${SAMPLE_COUNTS[@]}"; do
+            for sms in "${SMS_CONFIGS[@]}"; do
+                sms_label=$([[ "$sms" == "0" ]] && echo "auto" || echo "$sms")
+                m_bl=$(compute_mean "$backend" "$label" "$sms" "$samples" "bl_infer_avg")
+                m_gc=$(compute_mean "$backend" "$label" "$sms" "$samples" "gc_infer_avg")
+                m_d=$(compute_mean "$backend" "$label" "$sms" "$samples" "d_infer_avg")
+                printf "%-7s %-8s %5s │ %9s %9s %9s\n" \
+                    "$backend" "$label" "$sms_label" "$m_bl" "$m_gc" "$m_d"
+            done
+            printf '·%.0s' {1..50}; echo ""
+        done
+    done
+    printf '─%.0s' {1..50}; echo ""
+done
+
+render_table \
+    "TABLE 4: MEAN Inference Per-Kernel Execution Time by SM Partition Size (μs)" \
+    "Positive Δ = GC partitioning inference to fewer SMs. Near-zero = kernels not saturating."
+
+printf "%-7s %-8s %5s │ %9s %9s %9s\n" \
+    "Backend" "Model" "SMs" "BL Avg" "GC Avg" "Δ Avg%"
+printf '─%.0s' {1..50}; echo ""
+
+for backend in "${BACKENDS[@]}"; do
+    for config in "${MODEL_CONFIGS[@]}"; do
+        IFS=':' read -r label hidden layers input_size <<< "$config"
+        for samples in "${SAMPLE_COUNTS[@]}"; do
+            for sms in "${SMS_CONFIGS[@]}"; do
+                sms_label=$([[ "$sms" == "0" ]] && echo "auto" || echo "$sms")
+                m_bl=$(compute_mean "$backend" "$label" "$sms" "$samples" "ik_bl_avg")
+                m_gc=$(compute_mean "$backend" "$label" "$sms" "$samples" "ik_gc_avg")
+                m_d=$(compute_mean "$backend" "$label" "$sms" "$samples" "ik_d_avg")
+                printf "%-7s %-8s %5s │ %9s %9s %9s\n" \
+                    "$backend" "$label" "$sms_label" "$m_bl" "$m_gc" "$m_d"
+            done
+            printf '·%.0s' {1..50}; echo ""
+        done
+    done
+    printf '─%.0s' {1..50}; echo ""
+done
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Footer
