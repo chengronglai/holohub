@@ -73,14 +73,14 @@ Options:
   --base-img IMAGE       Container base image for holohub run
   --docker-opts OPTS     Extra docker options
   --backends "B1 B2"     Backends to sweep (default: "trt onnxrt")
-  --repeats N            Repeat each configuration N times (default: 5)
+  --repeats N            Repeat each configuration N times (default: 3)
   --sms "N1 N2 ..."      SM partition sizes to sweep (default: "8 16 32 48 0")
                          0 = auto (half GPU). Multiple values to find sweet spot
-  --samples "N1 N2 ..."  Override sample counts (default: "5000")
+  --samples "N1 N2 ..."  Override sample counts (default: "1000")
   --models "CONFIGS"     Override model configs (default: medium/large)
                          Format per config: "label:hidden_size:num_layers:input_size"
   --mode MODE            baseline | green-context | all (default: all)
-  --warmup N             Warmup samples (default: 500)
+  --warmup N             Warmup samples (default: 100)
   --dry-run              Print commands without executing
   -h, --help             Show this help
 

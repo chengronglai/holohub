@@ -471,7 +471,6 @@ class TimingBenchmarkOp : public Operator {
                           (poll_count * 2));
       }
     } else {
-      cuda_kernel_launch_start_time = -1.0;
       HOLOSCAN_LOG_WARN("[TimingBenchmarkOp] CUPTI profiler not available!");
     }
 
@@ -884,14 +883,6 @@ int main(int argc, char* argv[]) {
   // Initialize CUDA
   HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(0), "Failed to set CUDA device");
 
-  // Initialize CUPTI profiler
-  std::cout << "\nInitializing CUPTI profiler..." << std::endl;
-  auto* cupti_profiler = cupti_timing::CuptiSchedulingProfiler::getInstance();
-  if (!cupti_profiler->initialize()) {
-    std::cout << "[WARNING] CUPTI initialization failed - will use host-side timing only"
-              << std::endl;
-  }
-
   // Resolve YAML config path (same directory as the executable).
   std::filesystem::path exe_dir;
   try {
@@ -1019,19 +1010,18 @@ int main(int argc, char* argv[]) {
     std::cout << "  Average Latency:  " << std::setw(8)
               << cuda_kernel_launch_start_time_stats_without_gc.avg << " μs → "
               << std::setw(8) << cuda_kernel_launch_start_time_stats_with_gc.avg
-              << " μs  (" << std::showpos << avg_improvement << "%)"
+              << " μs  (" << std::showpos << avg_improvement << std::noshowpos << "%)"
               << std::endl;
     std::cout << "  95th Percentile:  " << std::setw(8)
               << cuda_kernel_launch_start_time_stats_without_gc.p95 << " μs → "
               << std::setw(8) << cuda_kernel_launch_start_time_stats_with_gc.p95
-              << " μs  (" << std::showpos << p95_improvement << "%)"
+              << " μs  (" << std::showpos << p95_improvement << std::noshowpos << "%)"
               << std::endl;
     std::cout << "  99th Percentile:  " << std::setw(8)
               << cuda_kernel_launch_start_time_stats_without_gc.p99 << " μs → "
               << std::setw(8) << cuda_kernel_launch_start_time_stats_with_gc.p99
-              << " μs  (" << std::showpos << p99_improvement << "%)"
+              << " μs  (" << std::showpos << p99_improvement << std::noshowpos << "%)"
               << std::endl << std::endl;
-    std::cout << std::noshowpos;
 
     if (cuda_kernel_execution_stats_without_gc.sample_count > 0 &&
         cuda_kernel_execution_stats_with_gc.sample_count > 0) {
@@ -1049,29 +1039,28 @@ int main(int argc, char* argv[]) {
       std::cout << "  Average Duration: " << std::setw(8)
                 << cuda_kernel_execution_stats_without_gc.avg << " μs → "
                 << std::setw(8) << cuda_kernel_execution_stats_with_gc.avg
-                << " μs  (" << std::showpos << exec_avg_improvement << "%)"
+                << " μs  (" << std::showpos << exec_avg_improvement << std::noshowpos << "%)"
                 << std::endl;
       std::cout << "  95th Percentile:  " << std::setw(8)
                 << cuda_kernel_execution_stats_without_gc.p95 << " μs → "
                 << std::setw(8) << cuda_kernel_execution_stats_with_gc.p95
-                << " μs  (" << std::showpos << exec_p95_improvement << "%)"
+                << " μs  (" << std::showpos << exec_p95_improvement << std::noshowpos << "%)"
                 << std::endl;
       std::cout << "  99th Percentile:  " << std::setw(8)
                 << cuda_kernel_execution_stats_without_gc.p99 << " μs → "
                 << std::setw(8) << cuda_kernel_execution_stats_with_gc.p99
-                << " μs  (" << std::showpos << exec_p99_improvement << "%)"
+                << " μs  (" << std::showpos << exec_p99_improvement << std::noshowpos << "%)"
                 << std::endl << std::endl;
-      std::cout << std::noshowpos;
     }
   }
 
-  // Display InferenceOp compute() wall-clock time
-  print_title("TRT InferenceOp Compute Time (Wall-Clock)");
-
-  auto print_compute_stats = [](const BenchmarkStats& stats, const std::string& label) {
+  // Reusable printer for any BenchmarkStats section
+  auto print_stats_section = [](const BenchmarkStats& stats, const std::string& label,
+                                const std::string& count_label = "Samples",
+                                const std::string& empty_msg = "Not available") {
     std::cout << "=== " << label << " ===" << std::endl;
     if (stats.sample_count == 0) {
-      std::cout << "  Not available" << std::endl << std::endl;
+      std::cout << "  " << empty_msg << std::endl << std::endl;
       return;
     }
     std::cout << std::fixed << std::setprecision(2);
@@ -1080,16 +1069,20 @@ int main(int argc, char* argv[]) {
     std::cout << "  Min:     " << stats.min_val << " μs" << std::endl;
     std::cout << "  P50:     " << stats.p50 << " μs" << std::endl;
     std::cout << "  P95:     " << stats.p95 << " μs" << std::endl;
+    std::cout << "  P99:     " << stats.p99 << " μs" << std::endl;
     std::cout << "  Max:     " << stats.max_val << " μs" << std::endl;
-    std::cout << "  Samples: " << stats.sample_count << std::endl << std::endl;
+    std::cout << "  " << count_label << ": " << stats.sample_count << std::endl << std::endl;
   };
 
+  // Display InferenceOp compute() wall-clock time
+  print_title("TRT InferenceOp Compute Time (Wall-Clock)");
+
   if (mode == "baseline" || mode == "all") {
-    print_compute_stats(inference_compute_stats_without_gc,
+    print_stats_section(inference_compute_stats_without_gc,
                         "Without Green Context (Baseline)");
   }
   if (mode == "green-context" || mode == "all") {
-    print_compute_stats(inference_compute_stats_with_gc,
+    print_stats_section(inference_compute_stats_with_gc,
                         "With Green Context");
   }
 
@@ -1110,31 +1103,15 @@ int main(int argc, char* argv[]) {
   // Display per-kernel inference GPU execution time (CUPTI-measured)
   print_title("TRT Inference Per-Kernel GPU Execution Time (CUPTI)");
 
-  auto print_inference_kernel_stats = [](const BenchmarkStats& stats, const std::string& label) {
-    std::cout << "=== " << label << " ===" << std::endl;
-    if (stats.sample_count == 0) {
-      std::cout << "  Not available (no inference kernels captured)" << std::endl;
-      return;
-    }
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  Average: " << stats.avg << " μs" << std::endl;
-    std::cout << "  Std Dev: " << stats.std_dev << " μs" << std::endl;
-    std::cout << "  Min:     " << stats.min_val << " μs" << std::endl;
-    std::cout << "  P50:     " << stats.p50 << " μs" << std::endl;
-    std::cout << "  P95:     " << stats.p95 << " μs" << std::endl;
-    std::cout << "  P99:     " << stats.p99 << " μs" << std::endl;
-    std::cout << "  Max:     " << stats.max_val << " μs" << std::endl;
-    std::cout << "  Kernels: " << stats.sample_count << std::endl;
-    std::cout << std::endl;
-  };
-
   if (mode == "baseline" || mode == "all") {
-    print_inference_kernel_stats(inference_kernel_exec_stats_without_gc,
-                                "Without Green Context (Baseline)");
+    print_stats_section(inference_kernel_exec_stats_without_gc,
+                        "Without Green Context (Baseline)", "Kernels",
+                        "Not available (no inference kernels captured)");
   }
   if (mode == "green-context" || mode == "all") {
-    print_inference_kernel_stats(inference_kernel_exec_stats_with_gc,
-                                "With Green Context");
+    print_stats_section(inference_kernel_exec_stats_with_gc,
+                        "With Green Context", "Kernels",
+                        "Not available (no inference kernels captured)");
   }
 
   if (mode == "all" &&
@@ -1162,7 +1139,8 @@ int main(int argc, char* argv[]) {
     std::cout << std::endl;
   }
 
-  // Cleanup CUPTI profiler
+  // Cleanup CUPTI profiler singleton
+  auto* cupti_profiler = cupti_timing::CuptiSchedulingProfiler::getInstance();
   if (cupti_profiler) {
     cupti_profiler->cleanup();
   }
