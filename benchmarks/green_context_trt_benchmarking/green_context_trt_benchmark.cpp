@@ -647,12 +647,14 @@ class GreenContextTrtBenchmarkApp : public holoscan::Application {
     inference_op_ = make_operator<CustomInferenceOp>(
         "inference_op",
         from_config("inference"),
-        Arg("backend", backend_),
         Arg("model_path_map", model_path_map),
         Arg("pre_processor_map", pre_processor_map),
         Arg("inference_map", inference_map),
         Arg("allocator") = pool_resource,
         Arg("cuda_stream_pool") = inference_stream_pool);
+    if (!backend_.empty()) {
+      inference_op_->add_arg(Arg("backend", backend_));
+    }
 
     sink_op_ = make_operator<InferenceTimingSinkOp>("sink_op");
 
@@ -786,7 +788,7 @@ void print_usage(const char* program_name) {
   std::cout << "  --warmup-samples N   Post-ready warmup iterations to discard (default: 100)\n";
   std::cout << "  --model-path PATH    Path to ONNX model file (default: ./benchmark_model.onnx)\n";
   std::cout << "  --input-size N       Input tensor size matching the model (default: 1024)\n";
-  std::cout << "  --backend BACKEND    Inference backend: 'trt' or 'onnxrt' (default: trt)\n";
+  std::cout << "  --backend BACKEND    Inference backend: 'trt' or 'onnxrt' (default: from YAML)\n";
   std::cout << "  --sms-per-partition N SMs per green context partition (default: auto = half GPU)\n";
   std::cout << "                        Use smaller values (8, 16) to stress-test SM partitioning\n";
   std::cout << "  --mode MODE          Run mode: 'baseline', 'green-context', "
@@ -808,7 +810,7 @@ int main(int argc, char* argv[]) {
   int warmup_samples = 100;
   std::string model_path = "benchmark_model.onnx";
   int input_size = 1024;
-  std::string backend = "trt";
+  std::string backend;  // empty = use YAML config value
   int sms_per_partition = 0;  // 0 = auto (half the GPU)
   std::string mode = "all";
 
@@ -875,14 +877,6 @@ int main(int argc, char* argv[]) {
   // Resolve to absolute path for InferenceOp
   model_path = std::filesystem::absolute(model_path).string();
 
-  print_title("Green Context Inference Benchmark");
-  std::cout << "Benchmark Configurations:" << std::endl;
-  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size, backend,
-                         sms_per_partition);
-
-  // Initialize CUDA
-  HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(0), "Failed to set CUDA device");
-
   // Resolve YAML config path (same directory as the executable).
   std::filesystem::path exe_dir;
   try {
@@ -895,6 +889,26 @@ int main(int argc, char* argv[]) {
     std::cerr << "Error: Benchmark config file not found: " << config_path << "\n";
     return 1;
   }
+
+  // If --backend was not specified on CLI, read it from the YAML config
+  // so that the printed configuration always shows the resolved value.
+  if (backend.empty()) {
+    auto yaml_config = holoscan::Config(config_path);
+    auto& yaml_node = yaml_config.yaml_nodes()[0];
+    if (yaml_node["inference"] && yaml_node["inference"]["backend"]) {
+      backend = yaml_node["inference"]["backend"].as<std::string>();
+    } else {
+      backend = "trt";
+    }
+  }
+
+  print_title("Green Context Inference Benchmark");
+  std::cout << "Benchmark Configurations:" << std::endl;
+  print_benchmark_config(mode, total_samples, warmup_samples, model_path, input_size, backend,
+                         sms_per_partition);
+
+  // Initialize CUDA
+  HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(0), "Failed to set CUDA device");
 
   BenchmarkStats cuda_kernel_launch_start_time_stats_without_gc,
                  cuda_kernel_launch_start_time_stats_with_gc;
