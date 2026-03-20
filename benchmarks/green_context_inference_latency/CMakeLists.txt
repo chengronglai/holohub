@@ -16,7 +16,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(green_context_inference_latency CXX)
 
-find_package(holoscan 3.6 REQUIRED CONFIG
+find_package(holoscan 3.10 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 
 find_package(CUDAToolkit REQUIRED)
