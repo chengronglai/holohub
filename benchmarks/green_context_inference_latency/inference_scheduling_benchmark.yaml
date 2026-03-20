@@ -1,0 +1,15 @@
+%YAML 1.2
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+---
+measured_inference:
+  input_on_cuda: true
+  output_on_cuda: true
+  transmit_on_cuda: true
+  enable_fp16: false
+
+contending_inference:
+  input_on_cuda: true
+  output_on_cuda: true
+  transmit_on_cuda: true
+  enable_fp16: false

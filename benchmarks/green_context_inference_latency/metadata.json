@@ -1,0 +1,34 @@
+{
+    "benchmark": {
+        "name": "Green Context Inference Latency",
+        "description": "Benchmark end-to-end inference pipeline latency and determinism under contending GPU workload, with and without CUDA Green Context",
+        "authors": [
+            {
+                "name": "Holoscan Team",
+                "affiliation": "NVIDIA"
+            }
+        ],
+        "language": "cpp",
+        "version": "1.0",
+        "changelog": {
+            "1.0": "Initial Release"
+        },
+        "holoscan_sdk": {
+            "minimum_required_version": "3.10.0",
+            "tested_versions": [
+                "3.10.0"
+            ]
+        },
+        "platforms": [
+            "x86_64",
+            "aarch64"
+        ],
+        "tags": ["Benchmarking", "CUDA", "Green Context", "Inference", "Scheduling", "Performance"],
+        "ranking": 1,
+        "requirements": {},
+        "run": {
+            "command": "<holohub_app_bin>/green_context_inference_latency",
+            "workdir": "holohub_app_bin"
+        }
+    }
+}
