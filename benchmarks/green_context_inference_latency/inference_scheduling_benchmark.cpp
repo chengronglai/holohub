@@ -351,8 +351,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
                                   int contending_input_size,
                                   const std::string& backend,
                                   int measured_sms, int contending_sms,
-                                  int64_t measured_period_ns,
-                                  int64_t contending_period_ns)
+                                  int measured_frequency_hz,
+                                  int contending_frequency_hz)
       : use_gc_(use_gc), total_samples_(total_samples), warmup_samples_(warmup_samples),
         measured_model_path_(measured_model_path),
         measured_input_size_(measured_input_size),
@@ -360,8 +360,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
         contending_input_size_(contending_input_size),
         backend_(backend),
         measured_sms_(measured_sms), contending_sms_(contending_sms),
-        measured_period_ns_(measured_period_ns),
-        contending_period_ns_(contending_period_ns) {}
+        measured_frequency_hz_(measured_frequency_hz),
+        contending_frequency_hz_(contending_frequency_hz) {}
 
   void compose() override {
     std::shared_ptr<CudaStreamPool> measured_stream_pool;
@@ -427,7 +427,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     auto measured_tx = make_operator<PeriodicTxOp>(
         "measured_tx",
         make_condition<PeriodicCondition>("measured_periodic",
-            std::chrono::nanoseconds(measured_period_ns_)));
+            Arg("recess_period") = std::to_string(measured_frequency_hz_) + "hz"));
     measured_tx->set_tensor_specs(measured_inputs);
     measured_tx->set_record_timestamps(true);
 
@@ -467,11 +467,11 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     std::vector<TensorSpec> contending_inputs = {{"input", {1, contending_input_size_}}};
 
     std::shared_ptr<PeriodicTxOp> contending_tx;
-    if (contending_period_ns_ > 0) {
+    if (contending_frequency_hz_ > 0) {
       contending_tx = make_operator<PeriodicTxOp>(
           "contending_tx",
           make_condition<PeriodicCondition>("contending_periodic",
-              std::chrono::nanoseconds(contending_period_ns_)));
+              Arg("recess_period") = std::to_string(contending_frequency_hz_) + "hz"));
     } else {
       contending_tx = make_operator<PeriodicTxOp>("contending_tx");
     }
@@ -530,8 +530,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   std::string backend_;
   int measured_sms_;
   int contending_sms_;
-  int64_t measured_period_ns_;
-  int64_t contending_period_ns_;
+  int measured_frequency_hz_;
+  int contending_frequency_hz_;
   std::shared_ptr<ops::InferenceOp> measured_inference_op_;
   std::shared_ptr<ops::InferenceOp> contending_inference_op_;
   std::shared_ptr<TimingRxOp> timing_rx_;
@@ -728,18 +728,13 @@ int main(int argc, char* argv[]) {
                            "Contending"))
     return 1;
 
-  int64_t measured_period_ns = static_cast<int64_t>(1e9 / frequency_hz);
-  int64_t contending_period_ns = contending_frequency_hz > 0
-      ? static_cast<int64_t>(1e9 / contending_frequency_hz) : 0;
-
   std::cout << std::endl;
   std::cout << std::string(80, '=') << std::endl;
   std::cout << "Green Context Inference Latency Benchmark" << std::endl;
   std::cout << std::string(80, '=') << std::endl;
   std::cout << "  Mode:                    " << mode << std::endl;
   std::cout << "  Backend:                 " << backend << std::endl;
-  std::cout << "  Measured freq:           " << frequency_hz << " Hz ("
-            << (measured_period_ns / 1000) << " \xce\xbcs period)" << std::endl;
+  std::cout << "  Measured freq:           " << frequency_hz << " Hz" << std::endl;
   std::cout << "  Contending freq:         "
             << (contending_frequency_hz > 0
                 ? std::to_string(contending_frequency_hz) + " Hz"
@@ -777,7 +772,7 @@ int main(int argc, char* argv[]) {
         measured_model_path, measured_input_size,
         contending_model_path, contending_input_size,
         backend, measured_sms, contending_sms,
-        measured_period_ns, contending_period_ns);
+        frequency_hz, contending_frequency_hz);
     app->config(config_path);
     app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
         "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16))));
