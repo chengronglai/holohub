@@ -69,65 +69,87 @@ def generate_fc_model(
     print(f"Generating ONNX model: {num_layers} FC layers, "
           f"input_size={input_size}, hidden_size={hidden_size}")
 
+    # Estimate total weight size upfront to decide serialization strategy.
+    weight_bytes = 0
+    prev = input_size
+    for i in range(num_layers):
+        out = input_size if i == num_layers - 1 else hidden_size
+        weight_bytes += prev * out * 4
+        prev = out
+    use_external = weight_bytes > 1.5 * 1024 * 1024 * 1024
+
+    if use_external:
+        print(f"Weights are {weight_bytes / (1024**3):.1f} GB -- using external data format")
+
     nodes = []
     initializers = []
-
-    # Track current tensor name and dimension through the network
     current_tensor = "input"
     current_dim = input_size
-
     rng = np.random.default_rng(seed=42)
 
-    for i in range(num_layers):
-        # Determine output dimension for this layer
-        if i == num_layers - 1:
-            # Last layer projects back to input_size
-            out_dim = input_size
-        else:
-            out_dim = hidden_size
+    data_filename = os.path.basename(output_path) + ".data"
+    data_filepath = os.path.join(os.path.dirname(os.path.abspath(output_path)), data_filename)
+    ext_file = open(data_filepath, "wb") if use_external else None
 
-        # Weight matrix: (current_dim, out_dim)
-        weight_name = f"W{i}"
-        # Use small random values (Xavier-like initialization) to avoid numerical issues
-        scale = np.sqrt(2.0 / (current_dim + out_dim))
-        weight_data = (rng.standard_normal((current_dim, out_dim)) * scale).astype(np.float32)
+    try:
+        for i in range(num_layers):
+            if i == num_layers - 1:
+                out_dim = input_size
+            else:
+                out_dim = hidden_size
 
-        initializers.append(
-            helper.make_tensor(
-                weight_name,
-                TensorProto.FLOAT,
-                [current_dim, out_dim],
-                weight_data.flatten().tolist(),
+            weight_name = f"W{i}"
+            scale = np.sqrt(2.0 / (current_dim + out_dim))
+            weight_data = (rng.standard_normal((current_dim, out_dim)) * scale).astype(np.float32)
+
+            if use_external:
+                raw = weight_data.tobytes()
+                offset = ext_file.tell()
+                ext_file.write(raw)
+                tensor = TensorProto()
+                tensor.name = weight_name
+                tensor.data_type = TensorProto.FLOAT
+                tensor.dims.extend([current_dim, out_dim])
+                tensor.data_location = TensorProto.EXTERNAL
+                for k, v in [("location", data_filename),
+                             ("offset", str(offset)),
+                             ("length", str(len(raw)))]:
+                    entry = tensor.external_data.add()
+                    entry.key = k
+                    entry.value = v
+                initializers.append(tensor)
+            else:
+                initializers.append(
+                    helper.make_tensor(
+                        weight_name,
+                        TensorProto.FLOAT,
+                        [current_dim, out_dim],
+                        weight_data.flatten().tolist(),
+                    )
+                )
+
+            matmul_output = f"matmul_{i}"
+            nodes.append(
+                helper.make_node("MatMul", [current_tensor, weight_name], [matmul_output],
+                                 name=f"MatMul_{i}")
             )
-        )
+            relu_output = f"relu_{i}"
+            nodes.append(
+                helper.make_node("Relu", [matmul_output], [relu_output], name=f"Relu_{i}")
+            )
+            current_tensor = relu_output
+            current_dim = out_dim
+    finally:
+        if ext_file is not None:
+            ext_file.close()
 
-        # MatMul node
-        matmul_output = f"matmul_{i}"
-        nodes.append(
-            helper.make_node("MatMul", [current_tensor, weight_name], [matmul_output],
-                             name=f"MatMul_{i}")
-        )
-
-        # ReLU activation
-        relu_output = f"relu_{i}"
-        nodes.append(
-            helper.make_node("Relu", [matmul_output], [relu_output], name=f"Relu_{i}")
-        )
-
-        current_tensor = relu_output
-        current_dim = out_dim
-
-    # Define input and output value infos
-    # Batch size is 1 (fixed) -- TensorRT will optimize for this
     input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, input_size])
     output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, input_size])
 
-    # Add an Identity node to rename the last relu output to "output"
     nodes.append(
         helper.make_node("Identity", [current_tensor], ["output"], name="Output_Identity")
     )
 
-    # Build the graph and model
     graph = helper.make_graph(
         nodes,
         "benchmark_fc_network",
@@ -142,19 +164,8 @@ def generate_fc_model(
     )
     model.ir_version = 8
 
-    # Validate and save -- use external data format for models > 2 GB
-    model_size = model.ByteSize()
-    if model_size > 2 * 1024 * 1024 * 1024:
-        print(f"Model proto is {model_size / (1024**3):.1f} GB -- using external data format")
-        # Save with external data (weights stored in a sibling .data file)
-        onnx.save(
-            model,
-            output_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=os.path.basename(output_path) + ".data",
-        )
-        # check_model needs the path when using external data
+    if use_external:
+        onnx.save(model, output_path)
         onnx.checker.check_model(output_path)
     else:
         onnx.checker.check_model(model)

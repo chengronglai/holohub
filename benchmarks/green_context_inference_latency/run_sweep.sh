@@ -68,7 +68,7 @@ extract_e2e_metrics_to_csv_row() {
       g_avg = g_std = g_p95 = g_p99 = "";
     }
     /End-to-End Pipeline Latency/ { in_e2e = 1; next }
-    /Contending Inference Pipeline Throughput/ { in_e2e = 0; next }
+    /Completion Period/ { in_e2e = 0; next }
     in_e2e && /^=== Comparison/ { section = ""; next }
     in_e2e && /^=== Baseline ===/ { section = "baseline"; next }
     in_e2e && /^=== Green Context ===/ { section = "gc"; next }

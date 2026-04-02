@@ -13,9 +13,14 @@ Both pipelines use **synthetic ONNX models** auto-generated at startup -- no ext
 
 ### What it Measures
 
-- **End-to-end pipeline latency**: Wall-clock time from `PeriodicTxOp` emission to `TimingRxOp` receipt (includes inference + scheduling overhead)
-- **Latency distribution**: Average, P50, P95, P99, min, max, standard deviation
-- **Green Context improvement**: Side-by-side comparison of baseline (shared GPU) vs. Green Context (partitioned SMs)
+For each inference cycle, the benchmark records `steady_clock` timestamps at `PeriodicTxOp::compute()` entry and after `cudaStreamSynchronize` in `TimingRxOp`. Two metrics are derived:
+
+- **E2E Pipeline Latency**: Time from `PeriodicTxOp` emission to GPU inference completion in `TimingRxOp` (`end - emit`). This is the primary per-cycle metric -- it tells you how long each individual inference cycle takes end-to-end.
+- **Completion Period**: Time between consecutive `TimingRxOp` completions (`end[N] - end[N-1]`). For a 1kHz target, nominal is 1000μs. Deviations reveal whether the pipeline can sustain the target throughput under contention.
+
+Additional:
+- **Latency distribution**: Average, P50, P95, P99, min, max, standard deviation for both metrics
+- **Green Context improvement**: Side-by-side comparison of baseline vs. Green Context
 - **Contending pipeline throughput**: Iterations completed and throughput (Hz) of the background workload
 
 ### Architecture
@@ -72,6 +77,10 @@ Options:
   --contending-hidden-size N  Hidden layer width (default: 4096)
   --contending-layers N       Number of FC layers (default: 6)
   --contending-frequency-hz N Contending pipeline Hz; 0=free-running (default: 0)
+
+  Scheduling:
+  --periodic-policy POLICY    PeriodicCondition policy (default: CatchUpMissedTicks)
+                              CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks
 
   Green Context partitioning:
   --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)

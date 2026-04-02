@@ -218,6 +218,17 @@ class TimingRxOp : public Operator {
 
   void compute(InputContext& op_input, OutputContext&, ExecutionContext&) override {
     (void)op_input.receive<std::any>("in");
+
+    // Always sync the inference stream immediately after receive, even during
+    // warmup. This ensures GPU work is complete before the next cycle.
+    auto streams = op_input.receive_cuda_streams("in");
+    if (!streams.empty() && streams[0].has_value()) {
+      cudaStreamSynchronize(streams[0].value());
+    }
+
+    auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
     int64_t emit_ns = 0;
     {
       std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
@@ -227,7 +238,7 @@ class TimingRxOp : public Operator {
       }
     }
     if (emit_ns <= 0) {
-      HOLOSCAN_LOG_WARN("[TimingRxOp] Missing emit timestamp for received tick; dropping sample");
+      HOLOSCAN_LOG_WARN("[TimingRxOp] Missing emit timestamp; dropping sample");
       return;
     }
 
@@ -249,19 +260,14 @@ class TimingRxOp : public Operator {
       return;
     }
 
-    auto streams = op_input.receive_cuda_streams("in");
-    if (!streams.empty() && streams[0].has_value()) {
-      cudaStreamSynchronize(streams[0].value());
-    }
+    double e2e_us = static_cast<double>(end_ns - emit_ns) / 1000.0;
+    e2e_us_.push_back(e2e_us);
 
-    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (now_ns < emit_ns) {
-      HOLOSCAN_LOG_WARN("[TimingRxOp] Non-monotonic latency sample (now < emit); dropping sample");
-      return;
+    if (prev_end_ns_ > 0) {
+      double completion_period_us = static_cast<double>(end_ns - prev_end_ns_) / 1000.0;
+      completion_period_us_.push_back(completion_period_us);
     }
-    double latency_us = static_cast<double>(now_ns - emit_ns) / 1000.0;
-    latencies_us_.push_back(latency_us);
+    prev_end_ns_ = end_ns;
 
     sample_count_++;
     int log_interval = std::max(1, total_samples_.get() / 10);
@@ -275,9 +281,8 @@ class TimingRxOp : public Operator {
     }
   }
 
-  BenchmarkStats get_latency_stats() const {
-    return calculate_stats(latencies_us_);
-  }
+  BenchmarkStats get_e2e_stats() const { return calculate_stats(e2e_us_); }
+  BenchmarkStats get_completion_period_stats() const { return calculate_stats(completion_period_us_); }
 
  private:
   Parameter<int> total_samples_;
@@ -285,7 +290,9 @@ class TimingRxOp : public Operator {
   int sample_count_ = 0;
   int warmup_pre_ready_count_ = 0;
   int warmup_post_ready_count_ = 0;
-  std::vector<double> latencies_us_;
+  int64_t prev_end_ns_ = 0;
+  std::vector<double> e2e_us_;
+  std::vector<double> completion_period_us_;
 };
 
 // ---------------------------------------------------------------------------
@@ -352,7 +359,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
                                   const std::string& backend,
                                   int measured_sms, int contending_sms,
                                   int measured_frequency_hz,
-                                  int contending_frequency_hz)
+                                  int contending_frequency_hz,
+                                  const std::string& periodic_policy)
       : use_gc_(use_gc), total_samples_(total_samples), warmup_samples_(warmup_samples),
         measured_model_path_(measured_model_path),
         measured_input_size_(measured_input_size),
@@ -361,7 +369,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
         backend_(backend),
         measured_sms_(measured_sms), contending_sms_(contending_sms),
         measured_frequency_hz_(measured_frequency_hz),
-        contending_frequency_hz_(contending_frequency_hz) {}
+        contending_frequency_hz_(contending_frequency_hz),
+        periodic_policy_(periodic_policy) {}
 
   void compose() override {
     std::shared_ptr<CudaStreamPool> measured_stream_pool;
@@ -427,7 +436,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     auto measured_tx = make_operator<PeriodicTxOp>(
         "measured_tx",
         make_condition<PeriodicCondition>("measured_periodic",
-            Arg("recess_period") = std::to_string(measured_frequency_hz_) + "hz"));
+            Arg("recess_period") = std::to_string(measured_frequency_hz_) + "hz",
+            Arg("policy") = periodic_policy_));
     measured_tx->set_tensor_specs(measured_inputs);
     measured_tx->set_record_timestamps(true);
 
@@ -471,7 +481,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
       contending_tx = make_operator<PeriodicTxOp>(
           "contending_tx",
           make_condition<PeriodicCondition>("contending_periodic",
-              Arg("recess_period") = std::to_string(contending_frequency_hz_) + "hz"));
+              Arg("recess_period") = std::to_string(contending_frequency_hz_) + "hz",
+              Arg("policy") = periodic_policy_));
     } else {
       contending_tx = make_operator<PeriodicTxOp>("contending_tx");
     }
@@ -507,9 +518,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     }
   }
 
-  BenchmarkStats get_latency_stats() const {
-    return timing_rx_->get_latency_stats();
-  }
+  BenchmarkStats get_e2e_stats() const { return timing_rx_->get_e2e_stats(); }
+  BenchmarkStats get_completion_period_stats() const { return timing_rx_->get_completion_period_stats(); }
 
   int get_contending_iters() const {
     return contending_sink_->get_completed_iters();
@@ -532,6 +542,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   int contending_sms_;
   int measured_frequency_hz_;
   int contending_frequency_hz_;
+  std::string periodic_policy_;
   std::shared_ptr<ops::InferenceOp> measured_inference_op_;
   std::shared_ptr<ops::InferenceOp> contending_inference_op_;
   std::shared_ptr<TimingRxOp> timing_rx_;
@@ -581,6 +592,9 @@ void print_usage(const char* prog) {
             << "  --contending-hidden-size N  Hidden layer width (default: 4096)\n"
             << "  --contending-layers N       Number of FC layers (default: 6)\n"
             << "  --contending-frequency-hz N Contending pipeline Hz; 0=free-running (default: 0)\n"
+            << "\n  Scheduling:\n"
+            << "  --periodic-policy POLICY    PeriodicCondition policy (default: CatchUpMissedTicks)\n"
+            << "                              CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks\n"
             << "\n  Green Context partitioning:\n"
             << "  --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)\n"
             << "  --measured-sms N            SMs for measured partition only, 0=auto (default: 0)\n"
@@ -629,6 +643,7 @@ int main(int argc, char* argv[]) {
   int measured_sms = 0;
   int contending_sms = 0;
   std::string mode = "all";
+  std::string periodic_policy = "CatchUpMissedTicks";
 
   int measured_input_size = 64;
   int measured_hidden_size = 256;
@@ -649,6 +664,7 @@ int main(int argc, char* argv[]) {
     else if (arg == "--backend" && i + 1 < argc) backend = argv[++i];
     else if (arg == "--frequency-hz" && i + 1 < argc) frequency_hz = std::atoi(argv[++i]);
     else if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
+    else if (arg == "--periodic-policy" && i + 1 < argc) periodic_policy = argv[++i];
     else if (arg == "--measured-input-size" && i + 1 < argc) measured_input_size = std::atoi(argv[++i]);
     else if (arg == "--measured-hidden-size" && i + 1 < argc) measured_hidden_size = std::atoi(argv[++i]);
     else if (arg == "--measured-layers" && i + 1 < argc) measured_layers = std::atoi(argv[++i]);
@@ -671,6 +687,13 @@ int main(int argc, char* argv[]) {
   }
   if (backend != "trt" && backend != "onnxrt") {
     std::cerr << "Error: --backend must be trt|onnxrt\n";
+    return 1;
+  }
+  if (periodic_policy != "CatchUpMissedTicks" &&
+      periodic_policy != "MinTimeBetweenTicks" &&
+      periodic_policy != "NoCatchUpMissedTicks") {
+    std::cerr << "Error: --periodic-policy must be "
+                 "CatchUpMissedTicks|MinTimeBetweenTicks|NoCatchUpMissedTicks\n";
     return 1;
   }
   if (frequency_hz <= 0 || total_samples <= 0 || warmup_samples < 0 ||
@@ -739,6 +762,7 @@ int main(int argc, char* argv[]) {
             << (contending_frequency_hz > 0
                 ? std::to_string(contending_frequency_hz) + " Hz"
                 : "free-running") << std::endl;
+  std::cout << "  Periodic policy:         " << periodic_policy << std::endl;
   std::cout << "  Samples:                 " << total_samples << std::endl;
   std::cout << "  Warmup:                  " << warmup_samples << std::endl;
   std::cout << "  Measured model:          " << measured_model_path
@@ -755,14 +779,11 @@ int main(int argc, char* argv[]) {
 
   HOLOSCAN_CUDA_CALL_THROW_ERROR(cudaSetDevice(0), "Failed to set CUDA device");
 
-  BenchmarkStats stats_baseline, stats_gc;
-  int contending_iters_bl = 0, contending_iters_gc = 0;
-  double contending_hz_bl = 0.0, contending_hz_gc = 0.0;
-
   struct RunResult {
-    BenchmarkStats latency;
-    int contending_iters;
-    double contending_throughput_hz;
+    BenchmarkStats e2e;
+    BenchmarkStats completion_period;
+    int contending_iters = 0;
+    double contending_throughput_hz = 0.0;
   };
 
   auto run_app_once = [&](bool use_gc) -> RunResult {
@@ -772,24 +793,24 @@ int main(int argc, char* argv[]) {
         measured_model_path, measured_input_size,
         contending_model_path, contending_input_size,
         backend, measured_sms, contending_sms,
-        frequency_hz, contending_frequency_hz);
+        frequency_hz, contending_frequency_hz, periodic_policy);
     app->config(config_path);
     app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
         "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16))));
     app->run();
-    return {app->get_latency_stats(),
+    return {app->get_e2e_stats(),
+            app->get_completion_period_stats(),
             app->get_contending_iters(),
             app->get_contending_throughput_hz()};
   };
+
+  RunResult bl{}, gc{};
 
   if (mode == "baseline" || mode == "all") {
     std::cout << std::string(80, '=') << std::endl;
     std::cout << "Running BASELINE (no Green Context)" << std::endl;
     std::cout << std::string(80, '=') << std::endl;
-    auto result = run_app_once(false);
-    stats_baseline = result.latency;
-    contending_iters_bl = result.contending_iters;
-    contending_hz_bl = result.contending_throughput_hz;
+    bl = run_app_once(false);
     std::cout << "Baseline complete." << std::endl;
   }
 
@@ -797,66 +818,62 @@ int main(int argc, char* argv[]) {
     std::cout << std::string(80, '=') << std::endl;
     std::cout << "Running GREEN CONTEXT" << std::endl;
     std::cout << std::string(80, '=') << std::endl;
-    auto result = run_app_once(true);
-    stats_gc = result.latency;
-    contending_iters_gc = result.contending_iters;
-    contending_hz_gc = result.contending_throughput_hz;
+    gc = run_app_once(true);
     std::cout << "Green Context complete." << std::endl;
   }
 
   // --- Results ---
 
-  std::cout << std::endl;
-  std::cout << std::string(80, '=') << std::endl;
-  std::cout << "End-to-End Pipeline Latency (TxOp \xe2\x86\x92 InferenceOp \xe2\x86\x92 RxOp)" << std::endl;
-  std::cout << std::string(80, '=') << std::endl;
+  auto pct = [](double a, double b) { return a != 0.0 ? (a - b) / a * 100.0 : 0.0; };
 
-  if (mode == "baseline" || mode == "all") {
-    print_stats(stats_baseline, "Baseline");
-    std::cout << std::endl;
-  }
-  if (mode == "green-context" || mode == "all") {
-    print_stats(stats_gc, "Green Context");
-    std::cout << std::endl;
-  }
-
-  auto pct_improvement = [](double bl, double gc) { return (bl - gc) / bl * 100.0; };
-
-  if (mode == "all" && stats_baseline.sample_count > 0 && stats_gc.sample_count > 0) {
-    std::cout << "=== Comparison (BL \xe2\x86\x92 GC) ===" << std::endl;
+  auto print_comparison = [&](const BenchmarkStats& a, const BenchmarkStats& b) {
+    if (a.sample_count == 0 || b.sample_count == 0) return;
     std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Avg:     " << a.avg     << " \xe2\x86\x92 " << b.avg     << " \xce\xbcs  (" << std::showpos << pct(a.avg,     b.avg)     << "%)" << std::noshowpos << std::endl;
+    std::cout << "  P95:     " << a.p95     << " \xe2\x86\x92 " << b.p95     << " \xce\xbcs  (" << std::showpos << pct(a.p95,     b.p95)     << "%)" << std::noshowpos << std::endl;
+    std::cout << "  P99:     " << a.p99     << " \xe2\x86\x92 " << b.p99     << " \xce\xbcs  (" << std::showpos << pct(a.p99,     b.p99)     << "%)" << std::noshowpos << std::endl;
+    std::cout << "  Std Dev: " << a.std_dev << " \xe2\x86\x92 " << b.std_dev << " \xce\xbcs  (" << std::showpos << pct(a.std_dev, b.std_dev) << "%)" << std::noshowpos << std::endl;
+  };
 
-    std::cout << "  Avg:        " << stats_baseline.avg << " \xe2\x86\x92 " << stats_gc.avg
-              << " \xce\xbcs  (" << std::showpos << pct_improvement(stats_baseline.avg, stats_gc.avg) << "%)" << std::endl;
-    std::cout << std::noshowpos;
-    std::cout << "  P95:        " << stats_baseline.p95 << " \xe2\x86\x92 " << stats_gc.p95
-              << " \xce\xbcs  (" << std::showpos << pct_improvement(stats_baseline.p95, stats_gc.p95) << "%)" << std::endl;
-    std::cout << std::noshowpos;
-    std::cout << "  P99:        " << stats_baseline.p99 << " \xe2\x86\x92 " << stats_gc.p99
-              << " \xce\xbcs  (" << std::showpos << pct_improvement(stats_baseline.p99, stats_gc.p99) << "%)" << std::endl;
-    std::cout << std::noshowpos;
-    std::cout << "  Std Dev:    " << stats_baseline.std_dev << " \xe2\x86\x92 " << stats_gc.std_dev
-              << " \xce\xbcs  (" << std::showpos << pct_improvement(stats_baseline.std_dev, stats_gc.std_dev) << "%)" << std::endl;
-    std::cout << std::noshowpos;
-  }
+  auto print_section = [&](const std::string& title, const std::string& subtitle,
+                           const BenchmarkStats& bl_s, const BenchmarkStats& gc_s) {
+    std::cout << std::endl << std::string(80, '=') << std::endl;
+    std::cout << title << std::endl;
+    std::cout << subtitle << std::endl;
+    std::cout << std::string(80, '=') << std::endl;
+    if (mode == "baseline" || mode == "all") { print_stats(bl_s, "Baseline"); std::cout << std::endl; }
+    if (mode == "green-context" || mode == "all") { print_stats(gc_s, "Green Context"); std::cout << std::endl; }
+    if (mode == "all") {
+      std::cout << "=== Comparison (BL \xe2\x86\x92 GC) ===" << std::endl;
+      print_comparison(bl_s, gc_s);
+      std::cout << std::endl;
+    }
+  };
 
-  std::cout << std::endl;
-  std::cout << std::string(80, '=') << std::endl;
+  print_section(
+      "End-to-End Pipeline Latency (PeriodicTxOp \xe2\x86\x92 TimingRxOp)",
+      "(steady_clock at TxOp::compute() \xe2\x86\x92 after cudaStreamSynchronize in RxOp)",
+      bl.e2e, gc.e2e);
+
+  print_section(
+      "Completion Period (inter-completion interval, nominal = "
+          + std::to_string(1'000'000 / frequency_hz) + " \xce\xbcs)",
+      "(time between consecutive TimingRxOp completions -- actual pipeline throughput)",
+      bl.completion_period, gc.completion_period);
+
+  std::cout << std::endl << std::string(80, '=') << std::endl;
   std::cout << "Contending Inference Pipeline Throughput" << std::endl;
   std::cout << std::string(80, '=') << std::endl;
   std::cout << std::fixed << std::setprecision(1);
-
   if (mode == "baseline" || mode == "all") {
     std::cout << "=== Baseline ===" << std::endl;
-    std::cout << "  Iterations: " << contending_iters_bl << std::endl;
-    std::cout << "  Throughput: " << contending_hz_bl << " Hz" << std::endl;
-    std::cout << std::endl;
+    std::cout << "  Iterations: " << bl.contending_iters << std::endl;
+    std::cout << "  Throughput: " << bl.contending_throughput_hz << " Hz" << std::endl << std::endl;
   }
   if (mode == "green-context" || mode == "all") {
     std::cout << "=== Green Context ===" << std::endl;
-    std::cout << "  Iterations: " << contending_iters_gc << std::endl;
-    std::cout << "  Throughput: " << contending_hz_gc << " Hz" << std::endl;
-    std::cout << std::endl;
+    std::cout << "  Iterations: " << gc.contending_iters << std::endl;
+    std::cout << "  Throughput: " << gc.contending_throughput_hz << " Hz" << std::endl << std::endl;
   }
 
   return 0;
