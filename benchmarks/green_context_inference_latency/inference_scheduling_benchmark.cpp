@@ -360,7 +360,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
                                   int measured_sms, int contending_sms,
                                   int measured_frequency_hz,
                                   int contending_frequency_hz,
-                                  const std::string& periodic_policy)
+                                  const std::string& periodic_policy,
+                                  bool pin_measured, SchedulingPolicy sched_policy)
       : use_gc_(use_gc), total_samples_(total_samples), warmup_samples_(warmup_samples),
         measured_model_path_(measured_model_path),
         measured_input_size_(measured_input_size),
@@ -370,7 +371,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
         measured_sms_(measured_sms), contending_sms_(contending_sms),
         measured_frequency_hz_(measured_frequency_hz),
         contending_frequency_hz_(contending_frequency_hz),
-        periodic_policy_(periodic_policy) {}
+        periodic_policy_(periodic_policy),
+        pin_measured_(pin_measured), sched_policy_(sched_policy) {}
 
   void compose() override {
     std::shared_ptr<CudaStreamPool> measured_stream_pool;
@@ -472,6 +474,26 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
       measured_inference_op_->add_arg(gc_pool);
     }
 
+    if (pin_measured_) {
+      // Use a zero-sized pool so only the per-operator pinned RT threads are created.
+      auto measured_pool = make_thread_pool("measured_pool", 0);
+      if (sched_policy_ == SchedulingPolicy::kDeadline) {
+        int64_t period_ns = 1'000'000'000LL / measured_frequency_hz_;
+        int64_t deadline_ns = period_ns;
+        int64_t runtime_ns = static_cast<int64_t>(period_ns * 0.90);
+        measured_pool->add_realtime(measured_tx, sched_policy_, true, {}, 0,
+                                   runtime_ns, deadline_ns, period_ns);
+        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, {}, 0,
+                                   runtime_ns, deadline_ns, period_ns);
+        measured_pool->add_realtime(timing_rx_, sched_policy_, true, {}, 0,
+                                   runtime_ns, deadline_ns, period_ns);
+      } else {
+        measured_pool->add_realtime(measured_tx, sched_policy_, true, {}, 99);
+        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, {}, 99);
+        measured_pool->add_realtime(timing_rx_, sched_policy_, true, {}, 99);
+      }
+    }
+
     // --- Contending pipeline: PeriodicTxOp → InferenceOp → ContendingSinkOp ---
 
     std::vector<TensorSpec> contending_inputs = {{"input", {1, contending_input_size_}}};
@@ -543,6 +565,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   int measured_frequency_hz_;
   int contending_frequency_hz_;
   std::string periodic_policy_;
+  bool pin_measured_;
+  SchedulingPolicy sched_policy_;
   std::shared_ptr<ops::InferenceOp> measured_inference_op_;
   std::shared_ptr<ops::InferenceOp> contending_inference_op_;
   std::shared_ptr<TimingRxOp> timing_rx_;
@@ -595,6 +619,9 @@ void print_usage(const char* prog) {
             << "\n  Scheduling:\n"
             << "  --periodic-policy POLICY    PeriodicCondition policy (default: CatchUpMissedTicks)\n"
             << "                              CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks\n"
+            << "  --pin-measured-pipeline     Pin measured pipeline ops to a dedicated thread pool\n"
+            << "  --scheduling-policy POL     RT scheduling: SCHED_FIFO (default), SCHED_RR, SCHED_DEADLINE\n"
+            << "                              Only applies when --pin-measured-pipeline is set\n"
             << "\n  Green Context partitioning:\n"
             << "  --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)\n"
             << "  --measured-sms N            SMs for measured partition only, 0=auto (default: 0)\n"
@@ -644,6 +671,8 @@ int main(int argc, char* argv[]) {
   int contending_sms = 0;
   std::string mode = "all";
   std::string periodic_policy = "CatchUpMissedTicks";
+  bool pin_measured = false;
+  std::string sched_policy_str = "SCHED_FIFO";
 
   int measured_input_size = 64;
   int measured_hidden_size = 256;
@@ -665,6 +694,8 @@ int main(int argc, char* argv[]) {
     else if (arg == "--frequency-hz" && i + 1 < argc) frequency_hz = std::atoi(argv[++i]);
     else if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
     else if (arg == "--periodic-policy" && i + 1 < argc) periodic_policy = argv[++i];
+    else if (arg == "--pin-measured-pipeline") pin_measured = true;
+    else if (arg == "--scheduling-policy" && i + 1 < argc) sched_policy_str = argv[++i];
     else if (arg == "--measured-input-size" && i + 1 < argc) measured_input_size = std::atoi(argv[++i]);
     else if (arg == "--measured-hidden-size" && i + 1 < argc) measured_hidden_size = std::atoi(argv[++i]);
     else if (arg == "--measured-layers" && i + 1 < argc) measured_layers = std::atoi(argv[++i]);
@@ -694,6 +725,17 @@ int main(int argc, char* argv[]) {
       periodic_policy != "NoCatchUpMissedTicks") {
     std::cerr << "Error: --periodic-policy must be "
                  "CatchUpMissedTicks|MinTimeBetweenTicks|NoCatchUpMissedTicks\n";
+    return 1;
+  }
+  SchedulingPolicy sched_policy{};
+  if (sched_policy_str == "SCHED_DEADLINE") {
+    sched_policy = SchedulingPolicy::kDeadline;
+  } else if (sched_policy_str == "SCHED_FIFO") {
+    sched_policy = SchedulingPolicy::kFirstInFirstOut;
+  } else if (sched_policy_str == "SCHED_RR") {
+    sched_policy = SchedulingPolicy::kRoundRobin;
+  } else {
+    std::cerr << "Error: --scheduling-policy must be SCHED_DEADLINE|SCHED_FIFO|SCHED_RR\n";
     return 1;
   }
   if (frequency_hz <= 0 || total_samples <= 0 || warmup_samples < 0 ||
@@ -763,6 +805,10 @@ int main(int argc, char* argv[]) {
                 ? std::to_string(contending_frequency_hz) + " Hz"
                 : "free-running") << std::endl;
   std::cout << "  Periodic policy:         " << periodic_policy << std::endl;
+  std::cout << "  Pin measured pipeline:   " << (pin_measured ? "yes" : "no") << std::endl;
+  if (pin_measured) {
+    std::cout << "  Scheduling policy:       " << sched_policy_str << std::endl;
+  }
   std::cout << "  Samples:                 " << total_samples << std::endl;
   std::cout << "  Warmup:                  " << warmup_samples << std::endl;
   std::cout << "  Measured model:          " << measured_model_path
@@ -793,7 +839,8 @@ int main(int argc, char* argv[]) {
         measured_model_path, measured_input_size,
         contending_model_path, contending_input_size,
         backend, measured_sms, contending_sms,
-        frequency_hz, contending_frequency_hz, periodic_policy);
+        frequency_hz, contending_frequency_hz, periodic_policy,
+        pin_measured, sched_policy);
     app->config(config_path);
     app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
         "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16))));

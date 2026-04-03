@@ -81,6 +81,8 @@ Options:
   Scheduling:
   --periodic-policy POLICY    PeriodicCondition policy (default: CatchUpMissedTicks)
                               CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks
+  --pin-measured-pipeline     Pin measured pipeline ops to a dedicated RT thread pool
+  --scheduling-policy POL     SCHED_FIFO (default), SCHED_RR, or SCHED_DEADLINE
 
   Green Context partitioning:
   --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)
@@ -91,6 +93,30 @@ Options:
   --model-dir PATH           Directory for generated models (default: exe dir)
   --help                     Show this message
 ```
+
+### Real-Time Pinning Requirements
+
+When using `--pin-measured-pipeline`, the measured pipeline operators are assigned to dedicated
+real-time scheduled worker threads.
+
+- `SCHED_FIFO` is the default and recommended policy for this benchmark.
+- Run the container as root with real-time privileges, for example:
+
+```bash
+./holohub run green_context_inference_latency \
+  --docker-opts="--privileged --user root --ulimit rtprio=99" \
+  --run-args="--pin-measured-pipeline"
+```
+
+- On the host, disable the Linux RT runtime limit before running RT sweeps:
+
+```bash
+sudo sysctl -w kernel.sched_rt_runtime_us=-1
+```
+
+- `SCHED_DEADLINE` is exposed for completeness, but it is not recommended with `InferenceOp`.
+  TensorRT engine loading and buffer allocation during initialization can exceed the thread budget
+  and cause `EAGAIN` during startup.
 
 ### Examples
 
