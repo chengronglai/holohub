@@ -263,11 +263,11 @@ class TimingRxOp : public Operator {
     double e2e_us = static_cast<double>(end_ns - emit_ns) / 1000.0;
     e2e_us_.push_back(e2e_us);
 
-    if (prev_end_ns_ > 0) {
-      double completion_period_us = static_cast<double>(end_ns - prev_end_ns_) / 1000.0;
-      completion_period_us_.push_back(completion_period_us);
+    if (prev_emit_ns_ > 0) {
+      double tx_period_us = static_cast<double>(emit_ns - prev_emit_ns_) / 1000.0;
+      tx_period_us_.push_back(tx_period_us);
     }
-    prev_end_ns_ = end_ns;
+    prev_emit_ns_ = emit_ns;
 
     sample_count_++;
     int log_interval = std::max(1, total_samples_.get() / 10);
@@ -282,7 +282,7 @@ class TimingRxOp : public Operator {
   }
 
   BenchmarkStats get_e2e_stats() const { return calculate_stats(e2e_us_); }
-  BenchmarkStats get_completion_period_stats() const { return calculate_stats(completion_period_us_); }
+  BenchmarkStats get_tx_period_stats() const { return calculate_stats(tx_period_us_); }
 
  private:
   Parameter<int> total_samples_;
@@ -290,9 +290,9 @@ class TimingRxOp : public Operator {
   int sample_count_ = 0;
   int warmup_pre_ready_count_ = 0;
   int warmup_post_ready_count_ = 0;
-  int64_t prev_end_ns_ = 0;
+  int64_t prev_emit_ns_ = 0;
   std::vector<double> e2e_us_;
-  std::vector<double> completion_period_us_;
+  std::vector<double> tx_period_us_;
 };
 
 // ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   }
 
   BenchmarkStats get_e2e_stats() const { return timing_rx_->get_e2e_stats(); }
-  BenchmarkStats get_completion_period_stats() const { return timing_rx_->get_completion_period_stats(); }
+  BenchmarkStats get_tx_period_stats() const { return timing_rx_->get_tx_period_stats(); }
 
   int get_contending_iters() const {
     return contending_sink_->get_completed_iters();
@@ -827,7 +827,7 @@ int main(int argc, char* argv[]) {
 
   struct RunResult {
     BenchmarkStats e2e;
-    BenchmarkStats completion_period;
+    BenchmarkStats tx_period;
     int contending_iters = 0;
     double contending_throughput_hz = 0.0;
   };
@@ -846,7 +846,7 @@ int main(int argc, char* argv[]) {
         "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16))));
     app->run();
     return {app->get_e2e_stats(),
-            app->get_completion_period_stats(),
+            app->get_tx_period_stats(),
             app->get_contending_iters(),
             app->get_contending_throughput_hz()};
   };
@@ -903,10 +903,10 @@ int main(int argc, char* argv[]) {
       bl.e2e, gc.e2e);
 
   print_section(
-      "Completion Period (inter-completion interval, nominal = "
+      "TxOp Firing Period (inter-fire interval, nominal = "
           + std::to_string(1'000'000 / frequency_hz) + " \xce\xbcs)",
-      "(time between consecutive TimingRxOp completions -- actual pipeline throughput)",
-      bl.completion_period, gc.completion_period);
+      "(time between consecutive PeriodicTxOp fires -- scheduler frequency accuracy)",
+      bl.tx_period, gc.tx_period);
 
   std::cout << std::endl << std::string(80, '=') << std::endl;
   std::cout << "Contending Inference Pipeline Throughput" << std::endl;

@@ -8,8 +8,8 @@ set -o pipefail
 APP="green_context_inference_latency"
 BASE_IMG="nvcr.io/nvidia/clara-holoscan/holoscan:v4.0.0-cuda13"
 
-SAMPLES=2000
-REPEATS=20
+SAMPLES=1000
+REPEATS=10
 FREQ_HZ=1000
 MODES="all"
 
@@ -24,12 +24,10 @@ RESULTS_CSV="${OUT_DIR}/latency_results.csv"
 # SM split configurations: name|measured_sms|contending_sms|c_input|c_hidden|c_layers
 CONFIGS=(
   "split_16_120_light|16|120|512|1024|3"
-  "split_16_120_medium|16|120|1024|4096|6"
-  "split_16_120_heavy|16|120|1024|4096|10"
+  "split_16_120_heavy|16|120|1024|8192|10"
 
   "split_32_104_light|32|104|512|1024|3"
-  "split_32_104_medium|32|104|1024|4096|6"
-  "split_32_104_heavy|32|104|1024|4096|10"
+  "split_32_104_heavy|32|104|1024|8192|10"
 )
 
 BACKENDS=("trt" "onnxrt")
@@ -39,8 +37,8 @@ PIN_POLICIES=("none" "SCHED_FIFO")
 
 CSV_HEADER="config,backend,pin_policy,repeat,measured_sms,contending_sms,c_input,c_hidden,c_layers"
 CSV_HEADER+=",e2e_bl_avg,e2e_bl_std,e2e_bl_p95,e2e_bl_p99,e2e_gc_avg,e2e_gc_std,e2e_gc_p95,e2e_gc_p99"
-CSV_HEADER+=",cp_bl_avg,cp_bl_std,cp_bl_p95,cp_bl_p99,cp_gc_avg,cp_gc_std,cp_gc_p95,cp_gc_p99"
-CSV_HEADER+=",e2e_avg_chg_pct,e2e_p99_chg_pct,cp_avg_chg_pct,status"
+CSV_HEADER+=",txp_bl_avg,txp_bl_std,txp_bl_p95,txp_bl_p99,txp_gc_avg,txp_gc_std,txp_gc_p95,txp_gc_p99"
+CSV_HEADER+=",e2e_avg_chg_pct,e2e_p99_chg_pct,txp_avg_chg_pct,status"
 echo "${CSV_HEADER}" > "${RESULTS_CSV}"
 
 check_rt_prereqs() {
@@ -128,18 +126,18 @@ for cfg in "${CONFIGS[@]}"; do
           --base-img="${BASE_IMG}" \
           --run-args="${run_args}" 2>&1 | tee "${log_file}"; then
 
-          e2e="$(extract_section_metrics "${log_file}" "End-to-End Pipeline Latency" "Completion Period")"
-          cp="$(extract_section_metrics "${log_file}" "Completion Period" "Contending Inference Pipeline")"
+          e2e="$(extract_section_metrics "${log_file}" "End-to-End Pipeline Latency" "TxOp Firing Period")"
+          txp="$(extract_section_metrics "${log_file}" "TxOp Firing Period" "Contending Inference Pipeline")"
           IFS=',' read -r e_ba e_bs e_bp95 e_bp99 e_ga e_gs e_gp95 e_gp99 <<< "${e2e}"
-          IFS=',' read -r c_ba c_bs c_bp95 c_bp99 c_ga c_gs c_gp95 c_gp99 <<< "${cp}"
-          if is_number "${e_ba}" && is_number "${e_bp99}" && is_number "${c_ba}"; then
+          IFS=',' read -r t_ba t_bs t_bp95 t_bp99 t_ga t_gs t_gp95 t_gp99 <<< "${txp}"
+          if is_number "${e_ba}" && is_number "${e_bp99}" && is_number "${t_ba}"; then
             e2e_avg_chg="$(pct_change "${e_ba}" "${e_ga}")"
             e2e_p99_chg="$(pct_change "${e_bp99}" "${e_gp99}")"
-            cp_avg_chg="$(pct_change "${c_ba}" "${c_ga}")"
+            txp_avg_chg="$(pct_change "${t_ba}" "${t_ga}")"
             row="${cfg_name},${backend},${pin_policy},${run_idx},${measured_sms},${contending_sms},${c_input},${c_hidden},${c_layers}"
             row+=",${e_ba},${e_bs},${e_bp95},${e_bp99},${e_ga},${e_gs},${e_gp95},${e_gp99}"
-            row+=",${c_ba},${c_bs},${c_bp95},${c_bp99},${c_ga},${c_gs},${c_gp95},${c_gp99}"
-            row+=",${e2e_avg_chg},${e2e_p99_chg},${cp_avg_chg},OK"
+            row+=",${t_ba},${t_bs},${t_bp95},${t_bp99},${t_ga},${t_gs},${t_gp95},${t_gp99}"
+            row+=",${e2e_avg_chg},${e2e_p99_chg},${txp_avg_chg},OK"
             echo "${row}" >> "${RESULTS_CSV}"
           else
             echo "${cfg_name},${backend},${pin_policy},${run_idx},${measured_sms},${contending_sms},${c_input},${c_hidden},${c_layers},,,,,,,,,,,,,,,,,,,,PARSE_FAIL" >> "${RESULTS_CSV}"
