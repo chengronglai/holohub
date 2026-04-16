@@ -364,7 +364,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
                                   int contending_frequency_hz,
                                   const std::string& periodic_policy,
                                   bool pin_measured, SchedulingPolicy sched_policy,
-                                  const std::vector<int>& pin_cores)
+                                  const std::vector<uint32_t>& pin_cores)
       : use_gc_(use_gc), total_samples_(total_samples), warmup_samples_(warmup_samples),
         measured_model_path_(measured_model_path),
         measured_input_size_(measured_input_size),
@@ -479,7 +479,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
 
     if (pin_measured_) {
       auto measured_pool = make_thread_pool("measured_pool", 0);
-      auto cores_for = [this](int op_idx) -> std::vector<int> {
+      auto cores_for = [this](int op_idx) -> std::vector<uint32_t> {
         if (pin_cores_.empty()) return {};
         if (pin_cores_.size() == 1) return {pin_cores_[0]};
         return {pin_cores_[static_cast<size_t>(op_idx)]};
@@ -574,7 +574,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   std::string periodic_policy_;
   bool pin_measured_;
   SchedulingPolicy sched_policy_;
-  std::vector<int> pin_cores_;
+  std::vector<uint32_t> pin_cores_;
   std::shared_ptr<ops::InferenceOp> measured_inference_op_;
   std::shared_ptr<ops::InferenceOp> contending_inference_op_;
   std::shared_ptr<TimingRxOp> timing_rx_;
@@ -688,7 +688,7 @@ int main(int argc, char* argv[]) {
   std::string periodic_policy = "CatchUpMissedTicks";
   bool pin_measured = false;
   std::string sched_policy_str = "SCHED_FIFO";
-  std::vector<int> pin_cores;
+  std::vector<uint32_t> pin_cores;
   bool enable_postcheck_fastpath = false;
 
   int measured_input_size = 64;
@@ -716,7 +716,8 @@ int main(int argc, char* argv[]) {
     else if (arg == "--pin-cores" && i + 1 < argc) {
       std::istringstream iss(argv[++i]);
       std::string token;
-      while (std::getline(iss, token, ',')) pin_cores.push_back(std::atoi(token.c_str()));
+      while (std::getline(iss, token, ','))
+        pin_cores.push_back(static_cast<uint32_t>(std::atoi(token.c_str())));
     }
     else if (arg == "--enable-postcheck-fastpath") enable_postcheck_fastpath = true;
     else if (arg == "--measured-input-size" && i + 1 < argc) measured_input_size = std::atoi(argv[++i]);
