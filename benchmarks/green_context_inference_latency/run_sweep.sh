@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-set -u
-set -o pipefail
+set -euo pipefail
 
 APP="green_context_inference_latency"
 BASE_IMG="nvcr.io/nvidia/clara-holoscan/holoscan:v4.0.0-cuda13"

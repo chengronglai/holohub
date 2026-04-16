@@ -16,7 +16,7 @@ Both pipelines use **synthetic ONNX models** auto-generated at startup -- no ext
 For each inference cycle, the benchmark records `steady_clock` timestamps at `PeriodicTxOp::compute()` entry and after `cudaStreamSynchronize` in `TimingRxOp`. Two metrics are derived:
 
 - **E2E Pipeline Latency**: Time from `PeriodicTxOp` emission to GPU inference completion in `TimingRxOp` (`end - emit`). This is the primary per-cycle metric -- it tells you how long each individual inference cycle takes end-to-end.
-- **Completion Period**: Time between consecutive `TimingRxOp` completions (`end[N] - end[N-1]`). For a 1kHz target, nominal is 1000μs. Deviations reveal whether the pipeline can sustain the target throughput under contention.
+- **TxOp Firing Period**: Time between consecutive `PeriodicTxOp` fires (`emit[N] - emit[N-1]`). For a 1kHz target, nominal is 1000μs. Deviations reveal whether the scheduler can sustain the target dispatch rate under contention.
 
 Additional:
 - **Latency distribution**: Average, P50, P95, P99, min, max, standard deviation for both metrics
@@ -83,6 +83,12 @@ Options:
                               CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks
   --pin-measured-pipeline     Pin measured pipeline ops to a dedicated RT thread pool
   --scheduling-policy POL     SCHED_FIFO (default), SCHED_RR, or SCHED_DEADLINE
+  --pin-cores C0[,C1,C2]     Pin RT threads to specific CPU cores (comma-separated).
+                              1 core: all ops on same core. 3 cores: one per op.
+                              Only applies when --pin-measured-pipeline is set.
+  --enable-postcheck-fastpath Enable EventBasedScheduler worker postcheck fast path.
+                              Lets workers bypass the dispatcher for READY/WAIT_TIME
+                              transitions. Requires SDK with this feature.
 
   Green Context partitioning:
   --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)
@@ -158,6 +164,14 @@ Contending pipeline at a fixed 60 Hz instead of free-running:
 ./holohub run green_context_inference_latency \
   --docker-opts="--user root" \
   --run-args="--contending-frequency-hz 60"
+```
+
+RT pinning with specific CPU cores and scheduler postcheck fast path:
+
+```bash
+./holohub run green_context_inference_latency \
+  --docker-opts="--privileged --user root --ulimit rtprio=99" \
+  --run-args="--pin-measured-pipeline --pin-cores 0,1,2 --enable-postcheck-fastpath"
 ```
 
 Show help:
