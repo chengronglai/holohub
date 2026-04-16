@@ -31,10 +31,12 @@
 #include <deque>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
 #include <holoscan/holoscan.hpp>
+#include <holoscan/core/component_spec.hpp>
 #include <holoscan/utils/cuda_macros.hpp>
 #include <holoscan/operators/inference/inference.hpp>
 #include <gxf/std/tensor.hpp>
@@ -153,6 +155,15 @@ class PeriodicTxOp : public Operator {
   }
 
   void compute(InputContext&, OutputContext& op_output, ExecutionContext& context) override {
+    if (record_timestamps_) {
+      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      {
+        std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
+        g_tx_emit_timestamps_ns.push_back(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+      }
+    }
+
     auto maybe_entity = nvidia::gxf::Entity::New(context.context());
     if (!maybe_entity) throw std::runtime_error("Failed to create GXF entity");
     auto entity = std::move(maybe_entity.value());
@@ -172,15 +183,6 @@ class PeriodicTxOp : public Operator {
           nvidia::gxf::MemoryStorageType::kDevice, gpu_buffers_[i],
           [](void*) { return nvidia::gxf::Success; });
       if (!result) throw std::runtime_error("Failed to wrap memory: " + ts.name);
-    }
-
-    if (record_timestamps_) {
-      auto now = std::chrono::steady_clock::now().time_since_epoch();
-      {
-        std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
-        g_tx_emit_timestamps_ns.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-      }
     }
 
     auto holoscan_entity = holoscan::gxf::Entity(std::move(entity));
@@ -361,7 +363,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
                                   int measured_frequency_hz,
                                   int contending_frequency_hz,
                                   const std::string& periodic_policy,
-                                  bool pin_measured, SchedulingPolicy sched_policy)
+                                  bool pin_measured, SchedulingPolicy sched_policy,
+                                  const std::vector<int>& pin_cores)
       : use_gc_(use_gc), total_samples_(total_samples), warmup_samples_(warmup_samples),
         measured_model_path_(measured_model_path),
         measured_input_size_(measured_input_size),
@@ -372,7 +375,8 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
         measured_frequency_hz_(measured_frequency_hz),
         contending_frequency_hz_(contending_frequency_hz),
         periodic_policy_(periodic_policy),
-        pin_measured_(pin_measured), sched_policy_(sched_policy) {}
+        pin_measured_(pin_measured), sched_policy_(sched_policy),
+        pin_cores_(pin_cores) {}
 
   void compose() override {
     std::shared_ptr<CudaStreamPool> measured_stream_pool;
@@ -433,7 +437,6 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     // --- Measured pipeline: PeriodicTxOp → InferenceOp → TimingRxOp ---
 
     std::vector<TensorSpec> measured_inputs = {{"input", {1, measured_input_size_}}};
-    std::vector<TensorSpec> measured_outputs = {{"output", {1, measured_input_size_}}};
 
     auto measured_tx = make_operator<PeriodicTxOp>(
         "measured_tx",
@@ -475,22 +478,26 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
     }
 
     if (pin_measured_) {
-      // Use a zero-sized pool so only the per-operator pinned RT threads are created.
       auto measured_pool = make_thread_pool("measured_pool", 0);
+      auto cores_for = [this](int op_idx) -> std::vector<int> {
+        if (pin_cores_.empty()) return {};
+        if (pin_cores_.size() == 1) return {pin_cores_[0]};
+        return {pin_cores_[static_cast<size_t>(op_idx)]};
+      };
       if (sched_policy_ == SchedulingPolicy::kDeadline) {
         int64_t period_ns = 1'000'000'000LL / measured_frequency_hz_;
         int64_t deadline_ns = period_ns;
         int64_t runtime_ns = static_cast<int64_t>(period_ns * 0.90);
-        measured_pool->add_realtime(measured_tx, sched_policy_, true, {}, 0,
+        measured_pool->add_realtime(measured_tx, sched_policy_, true, cores_for(0), 0,
                                    runtime_ns, deadline_ns, period_ns);
-        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, {}, 0,
+        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, cores_for(1), 0,
                                    runtime_ns, deadline_ns, period_ns);
-        measured_pool->add_realtime(timing_rx_, sched_policy_, true, {}, 0,
+        measured_pool->add_realtime(timing_rx_, sched_policy_, true, cores_for(2), 0,
                                    runtime_ns, deadline_ns, period_ns);
       } else {
-        measured_pool->add_realtime(measured_tx, sched_policy_, true, {}, 99);
-        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, {}, 99);
-        measured_pool->add_realtime(timing_rx_, sched_policy_, true, {}, 99);
+        measured_pool->add_realtime(measured_tx, sched_policy_, true, cores_for(0), 99);
+        measured_pool->add_realtime(measured_inference_op_, sched_policy_, true, cores_for(1), 99);
+        measured_pool->add_realtime(timing_rx_, sched_policy_, true, cores_for(2), 99);
       }
     }
 
@@ -567,6 +574,7 @@ class InferenceSchedulingBenchmarkApp : public holoscan::Application {
   std::string periodic_policy_;
   bool pin_measured_;
   SchedulingPolicy sched_policy_;
+  std::vector<int> pin_cores_;
   std::shared_ptr<ops::InferenceOp> measured_inference_op_;
   std::shared_ptr<ops::InferenceOp> contending_inference_op_;
   std::shared_ptr<TimingRxOp> timing_rx_;
@@ -619,9 +627,16 @@ void print_usage(const char* prog) {
             << "\n  Scheduling:\n"
             << "  --periodic-policy POLICY    PeriodicCondition policy (default: CatchUpMissedTicks)\n"
             << "                              CatchUpMissedTicks | MinTimeBetweenTicks | NoCatchUpMissedTicks\n"
-            << "  --pin-measured-pipeline     Pin measured pipeline ops to a dedicated thread pool\n"
+            << "  --pin-measured-pipeline     Pin measured pipeline ops to a dedicated RT thread pool\n"
             << "  --scheduling-policy POL     RT scheduling: SCHED_FIFO (default), SCHED_RR, SCHED_DEADLINE\n"
             << "                              Only applies when --pin-measured-pipeline is set\n"
+            << "  --pin-cores C0[,C1,C2]     Pin RT threads to specific CPU cores (comma-separated).\n"
+            << "                              1 core: all ops on same core. 3 cores: one per op.\n"
+            << "                              Only applies when --pin-measured-pipeline is set.\n"
+            << "  --enable-postcheck-fastpath Enable EventBasedScheduler worker postcheck fast path.\n"
+            << "                              Reduces scheduler dispatch overhead by letting workers\n"
+            << "                              bypass the dispatcher for READY/WAIT_TIME transitions.\n"
+            << "                              Requires SDK with enable_worker_postcheck_fastpath support.\n"
             << "\n  Green Context partitioning:\n"
             << "  --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)\n"
             << "  --measured-sms N            SMs for measured partition only, 0=auto (default: 0)\n"
@@ -673,6 +688,8 @@ int main(int argc, char* argv[]) {
   std::string periodic_policy = "CatchUpMissedTicks";
   bool pin_measured = false;
   std::string sched_policy_str = "SCHED_FIFO";
+  std::vector<int> pin_cores;
+  bool enable_postcheck_fastpath = false;
 
   int measured_input_size = 64;
   int measured_hidden_size = 256;
@@ -696,6 +713,12 @@ int main(int argc, char* argv[]) {
     else if (arg == "--periodic-policy" && i + 1 < argc) periodic_policy = argv[++i];
     else if (arg == "--pin-measured-pipeline") pin_measured = true;
     else if (arg == "--scheduling-policy" && i + 1 < argc) sched_policy_str = argv[++i];
+    else if (arg == "--pin-cores" && i + 1 < argc) {
+      std::istringstream iss(argv[++i]);
+      std::string token;
+      while (std::getline(iss, token, ',')) pin_cores.push_back(std::atoi(token.c_str()));
+    }
+    else if (arg == "--enable-postcheck-fastpath") enable_postcheck_fastpath = true;
     else if (arg == "--measured-input-size" && i + 1 < argc) measured_input_size = std::atoi(argv[++i]);
     else if (arg == "--measured-hidden-size" && i + 1 < argc) measured_hidden_size = std::atoi(argv[++i]);
     else if (arg == "--measured-layers" && i + 1 < argc) measured_layers = std::atoi(argv[++i]);
@@ -744,6 +767,32 @@ int main(int argc, char* argv[]) {
       contending_frequency_hz < 0) {
     std::cerr << "Error: invalid numeric argument(s)\n";
     return 1;
+  }
+  if (!pin_cores.empty() && pin_cores.size() != 1 && pin_cores.size() != 3) {
+    std::cerr << "Error: --pin-cores expects 1 or 3 comma-separated core IDs\n";
+    return 1;
+  }
+  if (!pin_cores.empty() && !pin_measured) {
+    std::cerr << "Error: --pin-cores requires --pin-measured-pipeline\n";
+    return 1;
+  }
+
+  if (enable_postcheck_fastpath) {
+    bool supported = false;
+    try {
+      holoscan::ComponentSpec probe_spec;
+      holoscan::EventBasedScheduler probe_sched;
+      probe_sched.setup(probe_spec);
+      supported = probe_spec.params().count("enable_worker_postcheck_fastpath") > 0;
+    } catch (...) {
+      supported = false;
+    }
+    if (!supported) {
+      std::cerr << "Error: --enable-postcheck-fastpath requires a Holoscan SDK version with\n"
+                << "enable_worker_postcheck_fastpath support on EventBasedScheduler.\n"
+                << "Remove --enable-postcheck-fastpath or upgrade your SDK.\n";
+      return 1;
+    }
   }
 
   // Resolve paths relative to executable directory
@@ -808,7 +857,17 @@ int main(int argc, char* argv[]) {
   std::cout << "  Pin measured pipeline:   " << (pin_measured ? "yes" : "no") << std::endl;
   if (pin_measured) {
     std::cout << "  Scheduling policy:       " << sched_policy_str << std::endl;
+    if (!pin_cores.empty()) {
+      std::cout << "  Pin cores:               ";
+      for (size_t i = 0; i < pin_cores.size(); i++) {
+        if (i > 0) std::cout << ",";
+        std::cout << pin_cores[i];
+      }
+      std::cout << std::endl;
+    }
   }
+  std::cout << "  Postcheck fastpath:      "
+            << (enable_postcheck_fastpath ? "yes" : "no") << std::endl;
   std::cout << "  Samples:                 " << total_samples << std::endl;
   std::cout << "  Warmup:                  " << warmup_samples << std::endl;
   std::cout << "  Measured model:          " << measured_model_path
@@ -840,10 +899,14 @@ int main(int argc, char* argv[]) {
         contending_model_path, contending_input_size,
         backend, measured_sms, contending_sms,
         frequency_hz, contending_frequency_hz, periodic_policy,
-        pin_measured, sched_policy);
+        pin_measured, sched_policy, pin_cores);
     app->config(config_path);
-    app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
-        "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16))));
+    auto sched = app->make_scheduler<holoscan::EventBasedScheduler>(
+        "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16)));
+    if (enable_postcheck_fastpath) {
+      sched->add_arg(holoscan::Arg("enable_worker_postcheck_fastpath", true));
+    }
+    app->scheduler(sched);
     app->run();
     return {app->get_e2e_stats(),
             app->get_tx_period_stats(),
