@@ -95,12 +95,19 @@ BenchmarkStats calculate_stats(const std::vector<double>& raw_values) {
 
 static std::atomic<bool> g_contending_pipeline_ready{false};
 static std::mutex g_tx_timestamps_mutex;
-static std::deque<int64_t> g_tx_emit_timestamps_ns;
+
+struct TimestampedSample {
+  int64_t emit_ns;
+  uint64_t seq;
+};
+static std::deque<TimestampedSample> g_tx_samples;
+static std::atomic<uint64_t> g_tx_seq_counter{0};
 
 void reset_global_benchmark_state() {
   g_contending_pipeline_ready.store(false, std::memory_order_release);
+  g_tx_seq_counter.store(0, std::memory_order_release);
   std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
-  g_tx_emit_timestamps_ns.clear();
+  g_tx_samples.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -156,11 +163,12 @@ class PeriodicTxOp : public Operator {
 
   void compute(InputContext&, OutputContext& op_output, ExecutionContext& context) override {
     if (record_timestamps_) {
-      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      uint64_t seq = g_tx_seq_counter.fetch_add(1, std::memory_order_relaxed);
       {
         std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
-        g_tx_emit_timestamps_ns.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+        g_tx_samples.push_back({now_ns, seq});
       }
     }
 
@@ -234,9 +242,17 @@ class TimingRxOp : public Operator {
     int64_t emit_ns = 0;
     {
       std::lock_guard<std::mutex> lock(g_tx_timestamps_mutex);
-      if (!g_tx_emit_timestamps_ns.empty()) {
-        emit_ns = g_tx_emit_timestamps_ns.front();
-        g_tx_emit_timestamps_ns.pop_front();
+      if (!g_tx_samples.empty()) {
+        auto sample = g_tx_samples.front();
+        g_tx_samples.pop_front();
+        emit_ns = sample.emit_ns;
+        if (sample.seq != expected_seq_) {
+          HOLOSCAN_LOG_ERROR("[TimingRxOp] Sequence mismatch: expected {} got {}. "
+                             "Pipeline message ordering violated.",
+                             expected_seq_, sample.seq);
+          throw std::runtime_error("Pipeline message ordering violated");
+        }
+        expected_seq_++;
       }
     }
     if (emit_ns <= 0) {
@@ -279,6 +295,9 @@ class TimingRxOp : public Operator {
     }
 
     if (sample_count_ >= total_samples_.get()) {
+      HOLOSCAN_LOG_INFO("[TimingRxOp] Sequence validation passed: {} samples, "
+                        "all in order (seq 0..{}).",
+                        sample_count_, expected_seq_ - 1);
       fragment()->stop_execution();
     }
   }
@@ -293,6 +312,7 @@ class TimingRxOp : public Operator {
   int warmup_pre_ready_count_ = 0;
   int warmup_post_ready_count_ = 0;
   int64_t prev_emit_ns_ = 0;
+  uint64_t expected_seq_ = 0;
   std::vector<double> e2e_us_;
   std::vector<double> tx_period_us_;
 };
@@ -637,6 +657,9 @@ void print_usage(const char* prog) {
             << "                              Reduces scheduler dispatch overhead by letting workers\n"
             << "                              bypass the dispatcher for READY/WAIT_TIME transitions.\n"
             << "                              Requires SDK with enable_worker_postcheck_fastpath support.\n"
+            << "  --worker-threads N          EventBasedScheduler worker thread count (default: 16).\n"
+            << "                              Set lower when using --pin-measured-pipeline to reduce\n"
+            << "                              CPU contention between default workers and RT threads.\n"
             << "\n  Green Context partitioning:\n"
             << "  --sms-per-partition N       SMs for both partitions, 0=auto (default: 0)\n"
             << "  --measured-sms N            SMs for measured partition only, 0=auto (default: 0)\n"
@@ -690,6 +713,7 @@ int main(int argc, char* argv[]) {
   std::string sched_policy_str = "SCHED_FIFO";
   std::vector<uint32_t> pin_cores;
   bool enable_postcheck_fastpath = false;
+  int worker_threads = 16;
 
   int measured_input_size = 64;
   int measured_hidden_size = 256;
@@ -720,6 +744,7 @@ int main(int argc, char* argv[]) {
         pin_cores.push_back(static_cast<uint32_t>(std::atoi(token.c_str())));
     }
     else if (arg == "--enable-postcheck-fastpath") enable_postcheck_fastpath = true;
+    else if (arg == "--worker-threads" && i + 1 < argc) worker_threads = std::atoi(argv[++i]);
     else if (arg == "--measured-input-size" && i + 1 < argc) measured_input_size = std::atoi(argv[++i]);
     else if (arg == "--measured-hidden-size" && i + 1 < argc) measured_hidden_size = std::atoi(argv[++i]);
     else if (arg == "--measured-layers" && i + 1 < argc) measured_layers = std::atoi(argv[++i]);
@@ -765,7 +790,7 @@ int main(int argc, char* argv[]) {
   if (frequency_hz <= 0 || total_samples <= 0 || warmup_samples < 0 ||
       measured_input_size <= 0 || measured_hidden_size <= 0 || measured_layers <= 0 ||
       contending_input_size <= 0 || contending_hidden_size <= 0 || contending_layers <= 0 ||
-      contending_frequency_hz < 0) {
+      contending_frequency_hz < 0 || worker_threads <= 0) {
     std::cerr << "Error: invalid numeric argument(s)\n";
     return 1;
   }
@@ -869,6 +894,7 @@ int main(int argc, char* argv[]) {
   }
   std::cout << "  Postcheck fastpath:      "
             << (enable_postcheck_fastpath ? "yes" : "no") << std::endl;
+  std::cout << "  Worker threads:          " << worker_threads << std::endl;
   std::cout << "  Samples:                 " << total_samples << std::endl;
   std::cout << "  Warmup:                  " << warmup_samples << std::endl;
   std::cout << "  Measured model:          " << measured_model_path
@@ -903,7 +929,7 @@ int main(int argc, char* argv[]) {
         pin_measured, sched_policy, pin_cores);
     app->config(config_path);
     auto sched = app->make_scheduler<holoscan::EventBasedScheduler>(
-        "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(16)));
+        "scheduler", holoscan::Arg("worker_thread_number", static_cast<int64_t>(worker_threads)));
     if (enable_postcheck_fastpath) {
       sched->add_arg(holoscan::Arg("enable_worker_postcheck_fastpath", true));
     }
