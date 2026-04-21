@@ -26,9 +26,20 @@
         "tags": ["Benchmarking", "CUDA", "Green Context", "Inference", "Scheduling", "Performance"],
         "ranking": 1,
         "requirements": {},
-        "run": {
-            "command": "<holohub_app_bin>/green_context_inference_latency",
-            "workdir": "holohub_app_bin"
+        "default_mode": "benchmark",
+        "modes": {
+            "benchmark": {
+                "run": {
+                    "command": "<holohub_app_bin>/green_context_inference_latency",
+                    "workdir": "holohub_app_bin"
+                }
+            },
+            "test_sm": {
+                "run": {
+                    "command": "<holohub_app_bin>/test_sm_inference_operator",
+                    "workdir": "holohub_app_bin"
+                }
+            }
         }
     }
 }

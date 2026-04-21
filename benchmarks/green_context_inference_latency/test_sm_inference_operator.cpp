@@ -1722,14 +1722,12 @@ int main(int argc, char* argv[]) {
   try { exe_dir = std::filesystem::canonical(argv[0]).parent_path(); }
   catch (...) { exe_dir = std::filesystem::absolute(argv[0]).parent_path(); }
 
-  auto config_path = std::filesystem::path(
-      "../tests/operators/inference_sm/inference_scheduling_benchmark.yaml");
+  auto config_path = exe_dir / "inference_scheduling_benchmark.yaml";
   if (!std::filesystem::exists(config_path)) {
     std::cerr << "Error: config not found: " << config_path << "\n"; return 1;
   }
 
-  auto gen_script = std::filesystem::path(
-      "../tests/operators/inference_sm/generate_onnx_model.py");
+  auto gen_script = exe_dir / "generate_onnx_model.py";
   if (!std::filesystem::exists(gen_script)) {
     std::cerr << "Error: model-generation script not found: " << gen_script << "\n"; return 1;
   }

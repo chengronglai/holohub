@@ -35,6 +35,20 @@ target_link_libraries(green_context_inference_latency
 
 target_include_directories(green_context_inference_latency PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 
+add_executable(test_sm_inference_operator
+    test_sm_inference_operator.cpp
+)
+
+target_link_libraries(test_sm_inference_operator
+    PRIVATE
+    holoscan::core
+    holoscan::ops::inference
+    CUDA::cuda_driver
+    CUDA::cudart
+)
+
+target_include_directories(test_sm_inference_operator PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+
 # Copy YAML config and model generation script to build directory
 add_custom_target(inference_scheduling_assets
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -47,3 +61,4 @@ add_custom_target(inference_scheduling_assets
     BYPRODUCTS "inference_scheduling_benchmark.yaml" "generate_onnx_model.py"
 )
 add_dependencies(green_context_inference_latency inference_scheduling_assets)
+add_dependencies(test_sm_inference_operator inference_scheduling_assets)
